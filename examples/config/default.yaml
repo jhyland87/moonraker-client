@@ -1,0 +1,12 @@
+# Moonraker specific configs
+API:
+  # Websocket specific configs. This is basically directly used when opening the websocket
+  # Doc: https://moonraker.readthedocs.io/en/latest/web_api/#websocket-connections
+  connection:
+    type: https
+    host: ws://192.168.0.50:7125/websocket
+    server: 192.168.0.50
+    port: 7125
+    path: /websocket
+    options:
+      perMessageDeflate: false

@@ -1,0 +1,21 @@
+{
+  "name": "moonraker-client",
+  "version": "1.0.0",
+  "description": "Just a Socket IO client for a Moonraker instance",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "config": "^3.3.11",
+    "js-yaml": "^4.1.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "chalk": "^4.1.2",
+    "sprint": "^0.3.1",
+    "sprintf-js": "^1.1.3"
+  }
+}
