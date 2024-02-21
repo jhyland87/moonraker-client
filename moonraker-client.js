@@ -1,107 +1,160 @@
+import { WebSocketServer, WebSocket } from 'ws';
+import EventEmitter from 'events';
+import { Buffer } from 'node:buffer';
+import * as axios from 'axios'
+//import * as net from 'net'
+import * as tcpPortUsed from 'tcp-port-used'
 
-const WebSocket = require('ws')
-const net = require('net')
-//const moonrakerMethods = require('./moonraker-methods-small.json')
-const { Buffer } = require('node:buffer');
-const EventEmitter = require('node:events');
-const utils = require('./utils')
-const socketStates = require('./socket_states')
-
-process.env.SUPPRESS_NO_CONFIG_WARNING = 'y';
-
-const config = require('config')
-
-//const eventEmitter = require('./MoonEvents');
+import SOCKET_STATES from './socket_states.js'
+import * as utils from './utils.js'
+//import {isUUID} from './utils.js'
 
 
-
-class MoonrakerClient {
+/*
+https://github.com/theturtle32/WebSocket-Node/blob/master/lib/WebSocketConnection.js#L143C21-L171
+*/
+export default class MoonrakerClient extends EventEmitter {
   #config = {};
-  #websocketOptions = {};
-  #websocket;
+  #wsOptions = {
+    handshakeTimeout: 1000
+  };
+  #ws;
   #pingTimeout = null;
   #heartbeatTimeout = (30000 + 1000); // 31 seconds
-  #websocketURL;
+  #wsURL;
   #requestCounter = 0;
-  #websocketStatus = undefined
-  
-  utils = utils;
+  #wsStatus = undefined
 
-  /**
-   * 
-   */
-  constructor(configOverrides) {
-    if (config.has('API.connection') === false ) {
+  constructor(config){
+    super()
+
+    if ( ! config?.API?.connection ) {
       throw new Error(`No API.connection found in config`)
     }
 
-    if ( typeof configOverrides === 'object' && Object.keys(configOverrides).length > 0){
-      config.util.extendDeep(config.API.connection, configOverrides);
+    this.#config = config.API.connection
 
-      // Since the config values are immutable, we need to create a new config item with
-      // the combined config values.
-      config.util.setModuleDefaults('API', config.API.connection);
+    this.#socketInit()
+  }
 
-      this.#config = config.get('API');
+  /**
+   * Initialize the websocket connection
+   */
+  #socketInit(){
+    if ( ! this.#wsURL )
+      this.#wsURL = MoonrakerClient.#makeWsURL(this.#config);
+
+    this.#ws = new WebSocket(this.#wsURL, this.#wsOptions || {})
+
+   
+    this.#ws.on( 'message', data => this.#ws_onMessage(data))
+
+    this.#ws.on( 'error',   data => this.#ws_onError(data))
+
+    this.#ws.on( 'error',   error => {
+      console.log('error.code:', error?.code)
+      console.log('error.message:', error?.message)
+      console.log('getOwnPropertyNames:',Object.getOwnPropertyNames(error))
+      //throw error
+    })
+
+    /*
+    this.#ws.on( 'message', data => console.log('WS message:',data))
+    this.#ws.on( 'close',   data => console.log('WS close:',data))
+    this.#ws.on( 'open',    data => console.log('WS open:',data))
+    this.#ws.on( 'ping',    data => console.log('WS ping:',data))
+    */
+
+    this.#ws.on( 'close',   data => this.#ws_onClose(data))
+    this.#ws.on( 'open',    data => this.#ws_onOpen(data))
+    this.#ws.on( 'ping',    data => this.#ws_onPing(data))
+  }
+
+  /**
+   * Heartbeat for checking on the connection status
+   * NOTE: This may need to be a public method..
+   */
+  #heartbeat(timeout){
+    
+    if ( this.#pingTimeout !== null ){
+      clearTimeout(this.#pingTimeout);
     }
-    else {
-      this.#config = config.get('API.connection')
+
+    // Use `WebSocket#terminate()`, which immediately destroys the connection,
+    // instead of `WebSocket#close()`, which waits for the close timer.
+    // Delay should be equal to the interval at which your server
+    // sends out pings plus a conservative assumption of the latency.
+    this.#pingTimeout = setTimeout(() => {
+      this.terminate();
+    }, timeout || this.#heartbeatTimeout );
+  }
+
+  /**
+   * 
+   */
+  #ws_on(onWhat, callback){
+    this.#ws.on(onWhat, callback)
+  }
+
+
+  /**
+   * 
+   */
+  #ws_onError(data){
+    //return
+    console.log('[onError], data:', data)
+    console.log('[onError], arguments:', arguments)
+    this.emit('error', data)
+  }
+
+  /**
+   * Executed for OPEN event 
+   */
+  #ws_onOpen(data){
+    this.emit('open')
+    this.#heartbeat();
+  }
+
+  /**
+   * Executed for PING event 
+   */
+  #ws_onPing(data){
+   this.#heartbeat();
+  }
+
+  /**
+   * Executed for CLOSE event 
+   */
+  #ws_onClose(data){
+    if ( this.#pingTimeout !== null ){
+      clearTimeout(this.#pingTimeout); 
     }
 
-    // Create the events object
-    this.events = new EventEmitter();
+    this.emit('close', data)
 
-    // Then initiate the websocket connection
-    this.#socketInit();
   }
 
   /**
-   * 
+   * Executed for MESSAGE event 
    */
-  static #checkPortStatus(host, port, timeout = 10000){
-    return new Promise(function(resolve, reject) {
-      let socket, timer;
-      const reqTs = Date.now();
+  #ws_onMessage(data){
+    try {
+      const messageObj = JSON.parse(data.toString())
 
-      timer = setTimeout(function() {
-        const _err = new Error(`timeout trying to connect to host ${host}, port ${port}`);
-        _err.responseTime = Date.now() - reqTs
-        reject(_err)
+      if ( messageObj.id ){
+        this.emit(`response:${messageObj.id}`, messageObj);
+      }
 
-        socket.end();
-      }, timeout);
-
-      socket = net.createConnection(port, host, function() {
-        clearTimeout(timer);
-        resolve({
-          result: 'successful',
-          responseTime: Date.now() - reqTs
-        });
-        socket.end();
-      });
-
-      socket.on('error', function(err) {
-        clearTimeout(timer);
-        err.responseTime = Date.now() - reqTs
-        reject(err);
-      });
-    });
+      if ( messageObj.method ){
+        this.emit(`method:${messageObj.method}`, messageObj);
+      }
+    }
+    catch(err){
+      console.log('ERROR:',err)
+      this.emit(`error`, err);  
+      this.emit(`error:${err.code || "nocode"}`, err);  
+    }
   }
-
-  /**
-   * 
-   */
-  static #checkPorts(host, ports, timeout){
-    return Promise.all( ports.map(p => MoonrakerClient.#checkPortStatus(host, p, timeout) ))
-  }
-
-  /**
-   * 
-   */
-  static fileListToFs(fileList){
-    // gcodeRootsResp.result.reduce((accumulator, currentValue, index) => mergeDeep(accumulator, path2obj(currentValue.path)), {})
-  }
-
 
   /**
    * Convert an object into a payload buffer (which can be sent to a websocket server)
@@ -137,87 +190,116 @@ class MoonrakerClient {
    * @return  {string}
    */
   static #makeWsURL( cfg ) {
-    if ( ! cfg.has('server') )
+    if ( ! cfg?.server  )
       throw new Error("No websocket SERVER specified")
 
-    return `ws://${cfg.get('server')}:${cfg.get('port') || 80}${cfg.get('path') || '/websocket'}`;
+    return `ws://${cfg.server}:${cfg?.port || 80}${cfg?.path || '/websocket'}`;
   }
 
   /**
-   * 
+   * Simple config getter, to make it read only to the public 
    */
-  on(event, callback){
-    this.#websocket.on(event, callback)
+  get config(){
+    return this.#config
+  }
+
+  /**
+   * Check port responsiveness
+   * 
+   * @param {number}  port      Port to connect to
+   * @param {number}  timeout   Timeout to use (defaults to config timeout)
+   */
+  checkPort2(port, timeout){
+    return new Promise((resolve, reject) => {
+      let socket, timer;
+      const reqTs = Date.now();
+
+      const testHost = this.#config.server
+      const testPort = port ||this.#config.port
+      const testTimeout = timeout || this.#config.timeout
+
+      timer = setTimeout(() => {
+        socket.end();
+
+        const err = new Error(`Exceeded timeout of ${testTimeout}ms trying to connect to ${testHost}:${testPort}`)
+        
+        err.result = `Exceeded ${testTimeout}ms timeout`
+        err.host = testHost
+        err.port = testPort
+        err.timeout = testTimeout
+        err.responseTime = Date.now() - reqTs
+        
+        reject(err)
+      }, testTimeout);
+
+      socket = net.createConnection(testPort, testHost, () =>  {
+        clearTimeout(timer);
+        resolve({
+          result: 'successful',
+          responseTime: Date.now() - reqTs
+        });
+        socket.end();
+      });
+
+      socket.on('error', err => {
+        clearTimeout(timer);
+
+        if ( ! err.result )
+          err.result = `Encountered socket error event`
+
+        if ( ! err.responseTime ) 
+          err.responseTime = Date.now() - reqTs
+
+        err.host = testHost
+        err.port = testPort
+        err.timeout = testTimeout
+    
+        reject(err);
+      });
+
+      socket.on('close', data => console.log('Socket triggered close event, with data:',data))
+      socket.on('connection', data => console.log('Socket triggered connection event, with data:',data))
+      socket.on('listening', data => console.log('Socket triggered listening event, with data:',data))
+      socket.on('drop', data => console.log('Socket triggered drop event, with data:',data))
+      //close connection error listening drop 
+
+    });
+  }
+
+  /**
+   * Much simpler method of checking if a port is open or not.  
+   */
+  async checkPort(port = this.#config.port){
+    try {
+      return await tcpPortUsed.check(port, this.#config.server)
+    }
+    catch(err){
+      return false
+    }
   }
 
   /**
    * Send a payload to the websocket service
    * 
    * @param   {Object}  payload   Object to form payload from and send
-   * @return  {Promise}            
+   * @return  {number}            Unique request ID for this payload            
    * @example 
    *  // Sends a websocket request
-   *  MoonrakerClientObj.sendPayload({ foo: 'bar' }).then(console.log)
+   *  const data = await MoonrakerClientObj.sendPayload({ foo: 'bar' })
    */
-  send( payload ){
-    return new Promise((resolve, reject) => {
-      //console.log('Sending payload:', JSON.stringify(payload))
+  async send( payload ){
+    const requestObj = MoonrakerClient.#payloadBuffer( payload );
 
-      // Create the buffer from the payload (this method will handle the
-      // payload verification/etc)
-      const requestObj = MoonrakerClient.#payloadBuffer( payload );
+    try {
+      // Send the websocket request
+      await this.#ws.send(requestObj.buffer)
 
-      try {
-        // Send the websocket request
-        this.#websocket.send(requestObj.buffer)
-
-        resolve(payload.id);
-      }
-      catch(err){ 
-        console.error(`[%s] ERROR while sending the request id %s:`, err.code, payload.id , err)
-        
-        reject(err)
-      }
-    })
-  }
-
-  /**
-   * Send a payload req to the websocket server and execute a callback
-   * once the response is received.
-   * 
-   * @param {string}            method  Method to call
-   * @param {(Object|function)} params  Either the parameters (object) or 
-   *                                  the callback function.
-   * @param {function}        cb      callback function.
-   *   
-   */
-  requestSync(method, params, cb){
-    if ( typeof params === 'function' ){
-      cb = params
-      params = undefined
+      return payload.id
     }
-
-    // Payload to send..
-    const payload = {
-      jsonrpc: "2.0",
-      method: method,
-      id: ++this.#requestCounter
-     // id: requestId
+    catch(err){ 
+      console.error(`[%s] ERROR while sending the request id %s:`, err.code, payload.id , err)
+      return err        
     }
-
-    if ( params ){
-      payload.params = params;
-    }
-
-    // Create a unique event ID to track this response by
-    const uniqueEvent = `websocket:response:${payload.id}`;
-
-    //console.log('Creating unique event:', uniqueEvent)
-    //console.log('with payload:', payload)
-    // Create the event using the ID..
-    this.events.on(uniqueEvent, cb)
-
-    this.send(payload);
   }
 
   /**
@@ -253,8 +335,9 @@ class MoonrakerClient {
       }
 
       try {
+
         // Create the event using the ID..
-        this.events.once(`websocket:response:${payload.id}`, data => {
+        this.once(`response:${payload.id}`, data => {
           // If there was an error in the response, then reject the promise with the error object
           if ( data.error ) 
             return reject(data.error)
@@ -284,20 +367,6 @@ class MoonrakerClient {
    */
   subscribe(objects){
     return new Promise((resolve, reject) => {
-      /*
-        {
-        "jsonrpc": "2.0",
-        "method": "printer.objects.subscribe",
-        "params": {
-            "objects": {
-                "gcode_move": null,
-                "toolhead": ["position", "status"]
-            }
-          },
-          "id": 5434
-        }
-      */
-
       // Payload to send..
       const payload = {
         jsonrpc: '2.0',
@@ -307,15 +376,11 @@ class MoonrakerClient {
        // id: requestId
       }
 
-      //console.log('Sending payload:',payload)
       // Create a unique event ID to track this response by
-      const uniqueEvent = `websocket:response:${payload.id}`;
+      const uniqueEvent = `response:${payload.id}`;
 
       // Create the event using the ID..
-      this.events.once(uniqueEvent, data => {
-        //console.log(`[${uniqueEvent}] subscribed - data:`, data)
-        resolve(data)
-      })
+      this.once(uniqueEvent, data => resolve(data))
 
       this.send(payload);
     })
@@ -349,221 +414,32 @@ class MoonrakerClient {
         return reject(`Invalid value provided (of type ${typeof from}): ${from}`)
       }
 
-      //console.log('Ubsub payload:', payload)
-
        // Create a unique event ID to track this response by
-      const uniqueEvent = `websocket:response:${payload.id}`;
+      const uniqueEvent = `response:${payload.id}`;
 
       // Create the event using the ID..
-      this.events.once(uniqueEvent, data => {
-        //console.log(`[${uniqueEvent}] UNSUBSCRIBE - data:`, data)
-        resolve(data)
-      })
+      this.once(uniqueEvent, data => resolve(data))
 
-      this.send(payload);
-
-      
+      this.send(payload);      
     })
   }
 
   /**
-   * Download webcam snapshot.
+   * Download file from Moonraker server
    * 
-   * Downloads snapshot from http://192.168.0.50/webcam/?action=snapshot
+   * @param   {string}  filename  Filename to download (full path)
+   * @returns {Promise<axios>}    Axios promise for HTTP GET request
+   * @example 
+   *  // Downloads klippy.log
+   *  const response = await moonrakerClient.downloadFile('/server/files/klippy.log')
    */
-  getSnapshot(){
-    // http://192.168.0.50/webcam/?action=snapshot
-  }
-
-  /**
-   * 
-   */
-  get config() {
-    //console.log('Config for MoonrakerClient is:', this.#config)
-    return this.#config
-  }
-
-  /**
-   * Get the websockets current state
-   * 
-   * @return {number}   Socket state. One of: CONNECTING (0), OPEN (1), 
-   *                    CLOSING (2) or CLOSED (3)
-   */
-  get state(){
-    return socketStates.fromState(this.#websocket?.readyState);
-  }
-
-  /**
-   * Get the websockets current state code
-   * 
-   * @return {string}   Socket state code. One of: 0 (CONNECTING), 1 (OPEN), 
-   *                    2 (CLOSING) or 3 (CLOSED)
-   */
-  get stateCode(){
-    return this.#websocket?.readyState;
-  }
-  
-  /**
-   * 
-   */
-  #heartbeat(timeout){
-    //console.log(`${Date.now()} - Heartbeat`)
-    if ( this.#pingTimeout !== null ){
-      clearTimeout(this.#pingTimeout);
+  downloadFile(filename){
+    if ( filename.startsWith('/') === false ){
+      filename = `/${filename}`
     }
 
-      // Use `WebSocket#terminate()`, which immediately destroys the connection,
-      // instead of `WebSocket#close()`, which waits for the close timer.
-      // Delay should be equal to the interval at which your server
-      // sends out pings plus a conservative assumption of the latency.
-      this.#pingTimeout = setTimeout(() => {
-        //this.terminate();
-      }, timeout || this.#heartbeatTimeout );
+    return axios.get(`http://${this.#config?.server}:${this.#config?.port || 80}${filename}`)
   }
-
-  /**
-   * 
-   */
-  #eventLogger(onEvent){
-    return function(){
-      //console.log(`Event %s triggered:`, onEvent)
-      //console.log.apply(this, arguments)
-    }
-  }
-
-  /**
-   * 
-   */
-  #socketInit(){
-    if ( ! this.#websocketURL )
-      this.#websocketURL = MoonrakerClient.#makeWsURL(this.#config);
-
-    this.#websocket = new WebSocket(this.#websocketURL, this.#websocketOptions || {})
-        
-    this.#websocket.on( 'message', data => this.#websocket_onMessage(data))
-
-    this.#websocket.on( 'error',   data => this.#websocket_onError(data))
-    this.#websocket.on( 'close',   data => this.#websocket_onClose(data))
-    this.#websocket.on( 'open',    data => this.#websocket_onOpen(data))
-    this.#websocket.on( 'ping',    data => this.#websocket_onPing(data))
-  }
-
-  /**
-   * 
-   */
-  #logWebsocketEvent(label, data){
-    if ( ! data && typeof label === 'object' ){
-      data = label;
-      label = null;
-    }
-    //console.log('Websocket event: ')
-  }
-
-  /**
-   * 
-   */
-  #websocket_on(onWhat, callback){
-    this.#websocket.on(onWhat, callback)
-  }
-
-  /**
-   * 
-   */
-  #websocket_onError(data){
-    return
-    console.log('[onError], data:', data)
-    console.log('[onError], arguments:', arguments)
-  }
-
-  /**
-   * Executed for OPEN event 
-   */
-  #websocket_onOpen(data){
-    this.#heartbeat();
-  }
-
-  /**
-   * Executed for PING event 
-   */
-  #websocket_onPing(data){
-   this.#heartbeat();
-  }
-
-  /**
-   * Executed for CLOSE event 
-   */
-  #websocket_onClose(data){
-    clearTimeout(this.#pingTimeout); 
-  }
-
-  /**
-   * Executed for MESSAGE event 
-   */
-  #websocket_onMessage(data){
-    try {
-      const messageObj = JSON.parse(data.toString())
-      //console.log('Message:', messageObj)
-
-      if ( messageObj.id ){
-        //console.log(`Triggering: websocket:response:${messageObj.id}:`,messageObj);
-        this.events.emit(`websocket:response:${messageObj.id}`, messageObj);
-      }
-
-      if ( messageObj.method ){
-        //console.log('Message for method:',messageObj.method)
-        this.events.emit(`websocket:method:${messageObj.method}`, messageObj);
-      }
-    }
-    catch(err){
-      this.events.emit(`websocket:error`, err);  
-      this.events.emit(`websocket:error:${err.code || "nocode"}`, err);  
-    }
-  }
-
-  /**
-   * Just a very siple wrapper to resolve filtered promise data (instead of the original promise data)
-   * 
-   * @param   {Promise}   promise   Promise to wrap
-   * @param   {function}  fn        Function to pass the resolved data through
-   * @return  {Promise}
-   * @example
-   *  // Return the klipper namespaces as an array, instead of an object with the 'namespaces' array
-   *  this.#returnPromiseData(this.request('server.database.list'), d => d.namespaces)
-   */
-  #returnPromiseData(promise, fn){
-    return new Promise(function(resolve, reject) {
-      promise
-        .then( data => resolve(fn(data)))
-        .catch(reject)
-    })
-  }
-
-
-  //
-  // Moonraker Specific Method Calls
-  // 
-
-  /**
-   * @typedef {Promise} ObjectStatus
-   * @property {object} result              Response body of query request
-   * @property {float}  result.eventtime    Timestamp generated by Klipper when the update 
-   *                                        was originally pushed. This timestamp is a float 
-   *                                        value, relative to Klipper's monotonic clock.
-   * @property {object} result.status       Status of all the objects that were requested.
-   * @see https://moonraker.readthedocs.io/en/latest/web_api/#query-printer-object-status
-   */
-
-  /**
-   * @typedef   {Object} PayloadBuffer
-   * @property  {number} id      The unique request ID
-   * @property  {Buffer} buffer  UTF-8 encoded buffer
-   */
-
-  /**
-   * @typedef {Promise} Result
-   * @property {Object|Array} The result of the SocketIO request.
-   */
-
 
   /**
    * Retrieve a list of available printer objects to query
@@ -628,8 +504,8 @@ class MoonrakerClient {
       objects[object] = null
     }
     else {
-      throw new Error(`Expected an object, array or string to retrieve printer objects, but was `
-        + `given a typeof '${typeof objects}'.`);
+      throw new Error(`Expected an object, array or string to retrieve printer objects, ` 
+        + `but was given a typeof '${typeof objects}'.`);
     }
 
     return this.request('printer.objects.query',{ objects })
@@ -659,6 +535,229 @@ class MoonrakerClient {
       'virtual_sdcard',
       'toolhead'
     ])
+  }
+
+  /**
+   * @typedef   {Object}  KlippyLog
+   * @property  {string}  raw_line  - full unmodified log line
+   * @property  {string}  log_type  - Type of log (ERROR, INFO or WARNING)
+   * @property  {Date}    date      - Date instance with the log date
+   * @property  {string}  account   - Account the log was created by
+   * @property  {string}  service   - Service that created the log entry
+   * @property  {string}  context   - work_handler, invoke_shutdown, logging_callback, etc
+   * @property  {string}  details   - The log entry itself (without the timestamp, account, type, etc)
+   * @property  {Array}   multiline - Array of associated lines following the main line
+   * @property  {Array}   stack     - Array of stacktrace lines following the main error
+   */
+
+  /**
+   * Parse the klippy.log file for any of the recent log entries. This can be used to
+   * populate a console prior to any WebSocket events creating new logs
+   * 
+   * @todo  Include stack traces in the log entries
+   * @todo  Better parsing logic can be found at: 
+   *          https://github.com/Klipper3d/klipper/blob/master/scripts/logextract.py
+   * @param   {Array|string}  logtype   Type(s) of logs to return. Can be any of:
+   *                                    INFO, WARNING or ERROR
+   * @param   {boolean}       detailed  Determines if the stacktrace or additional
+   *                                    lines (if there are any) should be included.
+   *                                    If true, then stacktraces will be returned in
+   *                                    the 'stack' property, and other types of extra 
+   *                                    lines will be in the 'multiline' property.
+   * @param   {string}        logfile   Which klippy log file to retrieve and parse
+   * @returns {KlippyLog[]}   Array of <KlippyLog> objects
+   * @example
+   *    moonrakerClient.parseKlippyLogs()
+   *      // Returnes array of parsed klippy.log
+   * @example
+   *    moonrakerClient.parseKlippyLogs({detailed: true})
+   *      // Returnes array of detailed logs from the current klippy.log
+   * @example
+   *    moonrakerClient.parseKlippyLogs({logtype:['INFO','WARNING']})
+   *      // Returnes array of info and warning logs from klippy.log
+   * @example
+   *    moonrakerClient.parseKlippyLogs({logtype:['INFO','WARNING'], detailed: true})
+   *      // Returnes array of deteiled errors from the current klippy.log
+   * @example
+   *    moonrakerClient.parseKlippyLogs({logtype:'ERROR', detailed: true, logfile:'klippy.log.3'})
+   *      // Returnes array of deteiled errors from klippy.log.3
+   */
+  // No idea why this type of parameter setup won't work >_<
+  //async parseKlippyLogs({logfile='klippy.log', detailed=false, logtype=null}){ 
+  async parseKlippyLogs(params = {detailed: false, logfile: 'klippy.log', logtype:null}){
+    //{logType=null, detailed=false, logfile='klippy.log'}
+    const {logtype, detailed, logfile} = params
+
+    const ignoredServices = ['statistics', 'serialhdl']
+
+    const ignoredContexts =['dump_request_log','_dump_debug','_record_local_log', 
+      '__init__', '_mcu_identify','check_slr_camera','work_handler','verify_heater',
+      'logging_callback','set_rollover_info', '_local_log_save','set_client_info',
+      'usb_reset','dump_file_stats','_handle_rpc_registration','_send_config',
+      'print_generated_points','_handle_shutdown','cmd_SDCARD_PRINT_FILE',
+      'handle_connect']
+
+    let log_type = ['ERROR','INFO','WARNING']
+
+    // If only a single log type..
+    if ( typeof logtype === 'string' ){
+      log_type = [ logtype.toUpperCase() ]
+    }
+    // Or multiple..
+    else if ( Array.isArray(logtype)){
+      if ( logtype.length > 0){
+        log_type = logtype.map(t => t.toUpperCase())
+      }
+    }
+    // just treat a boolean as a null, and anything else should fail
+    else if ( typeof logtype === 'boolean'){
+      throw new TypeError(`Unexpected value for log type. Expected a string or array, received a type ${typeof logtype}: ${logtype}`)
+    }
+
+    const logLinePtrn = new RegExp(`\\[(?<log_type>${log_type.join('|')})\\] (?<date>\\d{4}\\-\\d{2}\\-\\d{2} \\d{2}:\\d{2}:\\d{2}),\\d{1,3} \\[(?<account>[a-z]+)\\] \\[(?<service>[a-zA-Z_-]+):(?<context>[a-zA-Z_-]+):(\\d+)\\] (?<details>.*)$`, 'gm')
+    const logRolloverLinePtrn = new RegExp('^=+ Log rollover at (?<rollover_date>.*) =+$', 'g')
+
+    const logTypeIdx = {}
+    const logEntries = []
+    let logRolloverDate = null
+
+    // Logs only save if this is set to true, which needs to be done _after_ the log rollover line
+    let saveLogs = false
+
+    const logFileContent = await this.downloadFile(`/server/files/${logfile}`)
+
+    const logLines = logFileContent.data.split('\n')
+
+    logLines.forEach((line, idx, arr) => {
+      // If we aren't yet parsing logs, then check if this is the rollover line pattern, which
+      // would then enable log parsing
+      if ( saveLogs === false ){
+        logRolloverLinePtrn.lastIndex = 0
+
+        const rolloverCheck = logRolloverLinePtrn.exec(line)
+
+        if ( rolloverCheck !== null ){
+          logRolloverDate = rolloverCheck.groups.rollover_date;
+          saveLogs = true
+        }
+        
+        return
+      }
+
+      logLinePtrn.lastIndex = 0
+
+      // Check if this line matches the new log entry pattern
+      let lineMatch = logLinePtrn.exec(line)
+
+      // If this is a new log entry, then add it to the results
+      if ( lineMatch ){
+        //console.log(line); return
+        const lineMatches = {...lineMatch.groups}
+
+        // Ignore if necessary
+        if ( ignoredServices.includes(lineMatches.service)
+          || ignoredContexts.includes(lineMatches.context) 
+          || lineMatches.details.startsWith('Args:')
+          || lineMatches.details.startsWith('gcode state:')) {
+          return
+        }
+
+        lineMatches.raw_line = line;
+
+        lineMatches.date = new Date(Date.parse(lineMatches.date))
+
+        //console.log('match.groups:',{...lineMatch.groups})
+        logEntries.push(lineMatches)
+        return
+      }
+
+      // Don't bother processing the remaining lines if not needed
+      if ( detailed !== true ){
+        return
+      }
+
+      // If it doesn't match, then its possible this line is just more details for the previous
+      // line (if there isn one)
+
+      // If there isn't a previous line, then assume this is junk, and move on
+      if ( logEntries.length === 0 ) return
+
+      const lastLogIdx = logEntries.length-1
+
+      // If this line starts with Traceback, then create the stack array.
+      if ( line.startsWith('Traceback') === true ){
+        if ( ! logEntries[lastLogIdx]?.stack ){
+          logEntries[lastLogIdx].stack = []
+        }
+
+        logEntries[lastLogIdx].stack.push(line)
+        return
+      }
+
+      // If this line isn't ^Traceback, but the stack array does exist, then process this as
+      // another line for the existing stack
+      if ( logEntries[lastLogIdx]?.stack ){
+        logEntries[lastLogIdx].stack.push(line)
+        return
+      }
+      
+      // any other scenario would mean this is just an additional line for the previous log
+      if ( ! logEntries[lastLogIdx]?.multiline ){
+        logEntries[lastLogIdx].multiline = []
+      }
+
+      logEntries[lastLogIdx].multiline.push(line)
+    })
+
+    return logEntries
+    /*
+    //
+    // =====
+    // 
+
+    const logPattern = new RegExp('^\\[(?<log_type>ERROR|INFO)\\] (?<date>\\d{4}\\-\\d{2}\\-\\d{2} \\d{2}:\\d{2}:\\d{2}),\\d{1,3} \\[(?<account>[a-z]+)\\] \\[(?<service>(?!bed_mesh|virtual_sdcard|webhooks|__init__|statistics|gcode_move)[a-zA-Z_-]+):(?<category>(?!_record_local_log|set_rollover_info|_dump_debug|usb_reset|invoke_shutdown|move|dump_file_stats)[a-zA-Z_-]+):(\\d+)\\] (?<details>.*)$', 'gm')
+
+    const consoleHistory = []
+
+    const logFile = await this.downloadFile('/server/files/klippy.log')
+
+    const logLines = logFile.data.split('\n')
+
+    logLines.forEach((line, idx, arr) => {
+      const match = logPattern.exec(line)
+      if ( match === null  ){
+        return
+      }
+      const lineMatches = {...match.groups}
+
+      lineMatches.date = Date.parse(lineMatches.date)
+
+      let logType = 'info'
+        
+      if ( lineMatches.log_type === 'ERROR' ){
+        logType = 'error'
+      }
+
+      consoleHistory.push(lineMatches)
+    })
+
+    return consoleHistory
+    */
+  }
+
+  /**
+   * Look through the printer objects list for any objects starting with 
+   * 'gcode_macro', and parse those values for the macro names and return
+   * them in an array.
+   * 
+   * @return {Array}  List of macro names
+   */
+  async getMacros(){
+    const objectsList = await this.getObjectsList()
+
+    return objectsList?.objects
+      .filter(o => o.startsWith('gcode_macro '))
+      .map(o => o.replace(/^gcode_macro /,''))
   }
 
   /**
@@ -893,37 +992,101 @@ class MoonrakerClient {
     return this.request('server.webcams.test', { name })
   }
 
+
+
+  //
+  // CONTROL METHODS
+  //
+
+  /**
+   * Emergency Stop
+   * printer.emergency_stop printer.restart printer.firmware_restart  printer.print.resume
+   */
+  emergencyStop(){
+    // printer.emergency_stop
+  }
+
+  /**
+   * Restart Host Printer
+   */
+  restartPrinter(){
+    // printer.restart
+  }
+
+  /**
+   * Restart Klippy
+   */
+  restartFirmware(){
+    // printer.firmware_restart
+  }
+
+  /**
+   * Start print job
+   */
+  startPrint(filename){
+    // printer.print.start
+  }
+
+  /**
+   * Pause print job
+   */
+  pausePrint(){
+    // printer.print.pause
+  }
+
+  /**
+   * Resume print job
+   */
+  resumePrint(){
+    // printer.print.resume
+  }
+
+  /**
+   * Cancel print job
+   */
+  cancelPrint(){
+    // printer.print.cancel
+  }
+
+  // server.restart printer.restart printer.firmware_restart
+
+  /**
+   * Reboot the printer
+   */
+  reboot(){
+    // machine.reboot
+  }
+
+  /**
+   * Shutdown the printer
+   */
+  reboot(){
+    // machine.shutdow
+  }
+  
+  /**
+   * Start service
+   */
+  startService(service){
+    // machine.services.start
+  }
+
+  /**
+   * Stop service
+   */
+  stopService(service){
+    // machine.services.stop
+  }
+
+  /**
+   * Restart service
+   */
+  restartService(service){
+    // machine.services.restart
+  }
+
   close(){
-    return this.#websocket.close();
+    return this.#ws.close();
   }
 }
-
-module.exports = config => new MoonrakerClient(config)
-
-/*
-
-const dbConfig = config.get('Customer.dbConfig');
-db.connect(dbConfig, ...);
-
-if (config.has('optionalFeature.detail')) {
-  const detail = config.get('optionalFeature.detail');
-  //...
-}
-
-
-function MoonrakerClient(config) {
-    console.log('Loading MoonrakerClient with:', config)
-
-    this.config = config;
-
-    const wsClient = new WebSocket(config.host, config.options || {})
-
-
-    this.getConfig =  (data) => {
-       console.log('MoonrakerClient config:', this.config)
-    };
-
-    return this
-};
-
-*/
+//const connection = new WebSocket('ws://192.168.0.50:7125/websocket', { perMessageDeflate: false })

@@ -8,7 +8,7 @@
  * @param   {string}  uuid  String to check for RFC4122 status.
  * @return  {boolean}
  */
-module.exports.isUUID = uuid => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uuid)
+export const isUUID = uuid => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uuid)
 
 /**
  * Just a simple function to check if a variable is an object or not
@@ -16,8 +16,7 @@ module.exports.isUUID = uuid => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089a
  * @param   {*} obj   Variable to analyze
  * @return  {boolean}
  */
-module.exports.isObject = isObject = (obj) => (obj && typeof obj === 'object' && !Array.isArray(obj));
-
+export const isObject = (obj) => (obj && typeof obj === 'object' && !Array.isArray(obj));
 
 /**
  * Filter out an object using a callback, much like the Array.prototype.filter method
@@ -28,7 +27,7 @@ module.exports.isObject = isObject = (obj) => (obj && typeof obj === 'object' &&
  *  // returns {b: 'aa'}
  *  filterObj({a: 123, b: 'aa'}, (val, key, obj) =>  typeof val === 'string') 
  */
-module.exports.filterObj = filterObj = (obj, filterFn) => {
+export const filterObj = (obj, filterFn) => {
   let r = Object.entries(obj).filter(([key, val], obj) => filterFn(val, key, obj));
 
   return Object.fromEntries(r)
@@ -48,7 +47,7 @@ module.exports.filterObj = filterObj = (obj, filterFn) => {
  * @example 
  *    path2obj('a/b/c.gcode', true) // {"a": { "b": { "c.gcode": {} } }}
  */
-module.exports.path2obj = path2obj = (path, parent, excludePathProp) => {
+export const path2obj = (path, parent, excludePathProp) => {
   const pathSegments = path.split('/');
   let obj
   let o = obj = {};
@@ -103,7 +102,7 @@ module.exports.path2obj = path2obj = (path, parent, excludePathProp) => {
  *      "e": "test"
  *    }
  */
-module.exports.mergeDeep = mergeDeep= (target, ...sources) => {
+export const mergeDeep = (target, ...sources) => {
   if ( ! sources.length ) 
     return target;
 
@@ -127,11 +126,13 @@ module.exports.mergeDeep = mergeDeep= (target, ...sources) => {
   return mergeDeep(target, ...sources);
 }
 
-module.exports.mergeDeepArr = mergeDeepArr = (target, sources) => {
+/**
+ *
+ */
+export const mergeDeepArr = (target, sources) => {
   sources.unshift(target)
   return mergeDeep.apply(null, sources)
 }
-
 
 /**
  * Create an object to represent a list of files in a root directory
@@ -141,7 +142,7 @@ module.exports.mergeDeepArr = mergeDeepArr = (target, sources) => {
  * @return  {object}  An object to represent the files. Each subfolder in the pathnames
  *                    will create a new nested object.
  */
-module.exports.fileRoot2Obj = fileRoot2Obj = (rootArr, rootName) => {
+export const fileRoot2Obj = (rootArr, rootName) => {
   //console.log('rootArr:',rootArr)
   //console.log('rootArr (%s):',rootArr.length. rootArr)
 

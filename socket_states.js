@@ -7,6 +7,13 @@ const SOCKET_STATES = {
   CLOSED     : 3  // The connection is closed or couldn't be opened.
 }
 
+const STATE_DESCRIPTIONS = [
+  'Socket has been created. The connection is not yet open.',
+  'The connection is open and ready to communicate.',
+  'The connection is in the process of closing.',
+  'The connection is closed or could not be opened.'
+]
+
 // Reverse mapping index
 SOCKET_STATES.properties = Object.fromEntries(
   Object.entries(SOCKET_STATES).map(a => a.reverse())
@@ -16,4 +23,4 @@ SOCKET_STATES.properties = Object.fromEntries(
 SOCKET_STATES.fromState = value => SOCKET_STATES.properties[value]
 
 
-module.exports = SOCKET_STATES
+export default SOCKET_STATES
