@@ -2,6 +2,7 @@
  * Runtime type guards for the JSON-RPC message shapes. Using these instead of
  * `as` casts lets the compiler narrow the type itself, so the rest of the
  * client never has to lie about what it's holding.
+ * @source
  */
 import type {
   JsonRpcErrorResponse,
@@ -11,24 +12,36 @@ import type {
   PrinterStatus,
 } from './types.js';
 
-/** True for anything that looks structurally like a JSON-RPC 2.0 message. */
+/**
+ * True for anything that looks structurally like a JSON-RPC 2.0 message.
+ * @source
+ */
 export const isJsonRpcMessage = (value: unknown): value is JsonRpcMessage =>
   typeof value === 'object' &&
   value !== null &&
   'jsonrpc' in value &&
   value.jsonrpc === '2.0';
 
-/** True for replies to a request (i.e. has a numeric `id`). */
+/**
+ * True for replies to a request (i.e. has a numeric `id`).
+ * @source
+ */
 export const isJsonRpcResponse = (
   msg: JsonRpcMessage,
 ): msg is JsonRpcSuccessResponse | JsonRpcErrorResponse =>
   'id' in msg && typeof msg.id === 'number';
 
-/** True for server-pushed notifications (i.e. has a string `method`). */
+/**
+ * True for server-pushed notifications (i.e. has a string `method`).
+ * @source
+ */
 export const isJsonRpcNotification = (msg: JsonRpcMessage): msg is JsonRpcNotification =>
   'method' in msg && typeof msg.method === 'string';
 
-/** Discriminator between the success and error variants of a response. */
+/**
+ * Discriminator between the success and error variants of a response.
+ * @source
+ */
 export const isJsonRpcErrorResponse = (
   msg: JsonRpcSuccessResponse | JsonRpcErrorResponse,
 ): msg is JsonRpcErrorResponse => 'error' in msg;
@@ -37,6 +50,7 @@ export const isJsonRpcErrorResponse = (
  * The `params` shape of a `notify_status_update` notification: a 2-tuple of
  * `[status, eventtime]`. Validated structurally — we don't deeply inspect the
  * status object's contents (consumers do that based on what they subscribed to).
+ * @source
  */
 export const isStatusUpdateParams = (value: unknown): value is [PrinterStatus, number] =>
   Array.isArray(value) &&

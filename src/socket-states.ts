@@ -1,6 +1,7 @@
 /**
  * WebSocket readyState enumeration.
  * @see https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/readyState
+ * @source
  */
 export const SocketState = {
   CONNECTING: 0,

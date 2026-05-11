@@ -11,6 +11,7 @@ import type {
  * Response events: `response:<id>` — emitted once per JSON-RPC reply.
  * Method events:   `method:<method>` — emitted for every server-pushed notification
  *                  (e.g. `method:notify_status_update`).
+ * @source
  */
 export interface MoonrakerEvents {
   open: [];

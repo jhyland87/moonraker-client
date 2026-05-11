@@ -52,6 +52,7 @@ export type JsonRpcMessage<T = unknown> =
  * subscribe to. A null/undefined value means "all attributes for that object".
  *
  * See https://moonraker.readthedocs.io/en/latest/web_api/#query-printer-object-status
+ * @source
  */
 export type PrinterObjectSpec =
   | string
@@ -86,6 +87,7 @@ export interface NotifyStatusUpdateParams extends Array<unknown> {
  * sensors (e.g. plain thermistors) omit `targets` and `powers`.
  *
  * @see https://moonraker.readthedocs.io/en/latest/web_api/#get-cached-temperature-data
+ * @source
  */
 export interface TemperatureStoreSensor {
   readonly temperatures: readonly number[];

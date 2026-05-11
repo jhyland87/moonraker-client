@@ -45,6 +45,7 @@ const normalizeObjectSpec = (
  * loose `EventEmitter` ones inherited from the parent class — without
  * forcing us to override the methods at runtime (which would require
  * casting listeners through `(...args: unknown[]) => void`).
+ * @source
  */
 export interface MoonrakerClient {
   on<K extends keyof MoonrakerEvents & string>(
@@ -117,6 +118,7 @@ export interface MoonrakerClient {
  * ```
  *
  * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/ | Moonraker Web API}
+ * @source
  */
 export class MoonrakerClient extends EventEmitter {
   readonly #config: ConnectionConfig;
@@ -137,7 +139,7 @@ export class MoonrakerClient extends EventEmitter {
    * @param options - Optional client tuning.
    * @param options.heartbeatTimeoutMs - How long to wait between pings before
    *   force-terminating the socket. Defaults to `31000`.
-   * @throws {@link Error} if `config.API.connection` is missing or `server` is empty.
+   * @throws Error if `config.API.connection` is missing or `server` is empty.
    *
    * @example
    * ```ts
@@ -147,6 +149,7 @@ export class MoonrakerClient extends EventEmitter {
    *   },
    * });
    * ```
+   * @source
    */
   constructor(config: ClientConfig, options: { heartbeatTimeoutMs?: number } = {}) {
     super();
@@ -171,6 +174,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```ts
    * console.log(client.config.server); // '192.168.0.96'
    * ```
+   * @source
    */
   get config(): ConnectionConfig {
     return this.#config;
@@ -186,6 +190,7 @@ export class MoonrakerClient extends EventEmitter {
    * import { SocketState } from 'moonraker-client';
    * if (client.readyState === SocketState.OPEN) { /* ... *\/ }
    * ```
+   * @source
    */
   get readyState(): SocketStateValue {
     return this.#ws.readyState;
@@ -201,6 +206,7 @@ export class MoonrakerClient extends EventEmitter {
    * if (!client.isOpen) await once(client, 'open');
    * await client.request('printer.info');
    * ```
+   * @source
    */
   get isOpen(): boolean {
     return this.readyState === SocketState.OPEN;
@@ -219,7 +225,7 @@ export class MoonrakerClient extends EventEmitter {
    * @returns A promise that resolves with the response's `result`, or rejects
    *   with a {@link MoonrakerError} carrying the JSON-RPC error code.
    * @throws {@link MoonrakerError} for JSON-RPC error responses.
-   * @throws {@link Error} for transport errors.
+   * @throws Error for transport errors.
    *
    * @example
    * ```ts
@@ -233,6 +239,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```
    *
    * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#json-rpc-api-overview | JSON-RPC API overview}
+   * @source
    */
   request<T = unknown>(method: string, params?: unknown): Promise<T> {
     const { promise, resolve, reject } = Promise.withResolvers<T>();
@@ -292,6 +299,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```
    *
    * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#subscribe-to-printer-object-status | Subscribe to Printer Object Status}
+   * @source
    */
   subscribe(spec: PrinterObjectSpec): Promise<SubscribeResult> {
     return this.request<SubscribeResult>('printer.objects.subscribe', {
@@ -310,6 +318,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```ts
    * await client.unsubscribe();
    * ```
+   * @source
    */
   unsubscribe(): Promise<SubscribeResult> {
     return this.request<SubscribeResult>('printer.objects.subscribe', { objects: {} });
@@ -339,6 +348,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```
    *
    * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#query-printer-object-status | Query Printer Object Status}
+   * @source
    */
   queryObjects(spec: PrinterObjectSpec): Promise<SubscribeResult> {
     return this.request<SubscribeResult>('printer.objects.query', {
@@ -363,6 +373,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```
    *
    * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#list-available-printer-objects | List Available Printer Objects}
+   * @source
    */
   getObjectsList(): Promise<{ objects: string[] }> {
     return this.request('printer.objects.list');
@@ -382,6 +393,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```
    *
    * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#query-server-info | Query Server Info}
+   * @source
    */
   getServerInfo(): Promise<unknown> {
     return this.request('server.info');
@@ -400,6 +412,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```
    *
    * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#get-klippy-host-information | Get Klippy Host Information}
+   * @source
    */
   getPrinterInfo(): Promise<unknown> {
     return this.request('printer.info');
@@ -428,6 +441,7 @@ export class MoonrakerClient extends EventEmitter {
    * ```
    *
    * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#get-cached-temperature-data | Get Cached Temperature Data}
+   * @source
    */
   getTemperatureStore(
     options: { includeMonitors?: boolean } = {},
@@ -455,6 +469,7 @@ export class MoonrakerClient extends EventEmitter {
    *   process.exit(0);
    * });
    * ```
+   * @source
    */
   close(code?: number, reason?: string): void {
     if (this.#pingTimeout !== null) {
@@ -469,6 +484,7 @@ export class MoonrakerClient extends EventEmitter {
   /**
    * Open the underlying ws connection and wire its events through to the
    * EventEmitter surface.
+   * @source
    */
   #openSocket(): WebSocket {
     const ws = new WebSocket(this.#wsURL, this.#wsOptions);
@@ -482,13 +498,19 @@ export class MoonrakerClient extends EventEmitter {
     return ws;
   }
 
-  /** Arm the heartbeat watchdog and emit `'open'`. */
+  /**
+   * Arm the heartbeat watchdog and emit `'open'`.
+   * @source
+   */
   #handleOpen(): void {
     this.#resetHeartbeat();
     this.emit('open');
   }
 
-  /** Cancel the heartbeat watchdog and emit `'close'`. */
+  /**
+   * Cancel the heartbeat watchdog and emit `'close'`.
+   * @source
+   */
   #handleClose(code: number, reason: string): void {
     if (this.#pingTimeout !== null) {
       clearTimeout(this.#pingTimeout);
@@ -502,6 +524,7 @@ export class MoonrakerClient extends EventEmitter {
    * (replies) or a `method:${name}` event (server-pushed notifications). For
    * the special `notify_status_update` method, additionally fire the
    * convenience `'notify:status_update'` event with `[status, eventtime]`.
+   * @source
    */
   #handleMessage(data: WebSocket.RawData): void {
     let parsed: unknown;
@@ -530,13 +553,17 @@ export class MoonrakerClient extends EventEmitter {
   /**
    * (Re-)arm the heartbeat timeout. If no `ping` arrives within
    * `heartbeatTimeoutMs`, the socket is hard-terminated.
+   * @source
    */
   #resetHeartbeat(): void {
     if (this.#pingTimeout !== null) clearTimeout(this.#pingTimeout);
     this.#pingTimeout = setTimeout(() => this.#ws.terminate(), this.#heartbeatTimeoutMs);
   }
 
-  /** Send a single frame, rejecting if the socket is not open. */
+  /**
+   * Send a single frame, rejecting if the socket is not open.
+   * @source
+   */
   async #send(payload: JsonRpcRequest): Promise<void> {
     if (this.#ws.readyState !== SocketState.OPEN) {
       throw new Error(`Cannot send: websocket not open (state ${this.#ws.readyState})`);
@@ -547,7 +574,10 @@ export class MoonrakerClient extends EventEmitter {
     });
   }
 
-  /** Build the `ws://host:port/path` URL from a {@link ConnectionConfig}. */
+  /**
+   * Build the `ws://host:port/path` URL from a {@link ConnectionConfig}.
+   * @source
+   */
   static #buildUrl(cfg: ConnectionConfig): string {
     if (!cfg.server) throw new Error('No websocket server specified in connection config');
     const port = cfg.port ?? 80;
