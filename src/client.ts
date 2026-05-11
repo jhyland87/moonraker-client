@@ -1,0 +1,557 @@
+import { EventEmitter } from 'node:events';
+import WebSocket, { type ClientOptions } from 'ws';
+
+import { MoonrakerError } from './errors.js';
+import type { MoonrakerEvents } from './events.js';
+import {
+  isJsonRpcErrorResponse,
+  isJsonRpcMessage,
+  isJsonRpcNotification,
+  isJsonRpcResponse,
+  isStatusUpdateParams,
+} from './guards.js';
+import { SocketState, type SocketStateValue } from './socket-states.js';
+import {
+  type ClientConfig,
+  type ConnectionConfig,
+  type JsonRpcRequest,
+  type PrinterObjectSpec,
+  type SubscribeResult,
+  type TemperatureStore,
+} from './types.js';
+
+const DEFAULT_HEARTBEAT_MS = 31_000;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 1_000;
+
+// `Array.isArray` doesn't narrow `readonly T[]` out of a union (TS issue
+// #17002), so we wrap it in our own predicate that promises the correct type.
+const isReadonlyStringArray = (v: unknown): v is readonly string[] => Array.isArray(v);
+
+const normalizeObjectSpec = (
+  spec: PrinterObjectSpec,
+): Record<string, readonly string[] | null> => {
+  if (typeof spec === 'string') {
+    return { [spec]: null };
+  }
+  if (isReadonlyStringArray(spec)) {
+    return Object.fromEntries(spec.map((name) => [name, null]));
+  }
+  return spec;
+};
+
+/**
+ * Typed event-emitter signatures for {@link MoonrakerClient}, applied via
+ * interface declaration merging. This adds strict overloads alongside the
+ * loose `EventEmitter` ones inherited from the parent class — without
+ * forcing us to override the methods at runtime (which would require
+ * casting listeners through `(...args: unknown[]) => void`).
+ */
+export interface MoonrakerClient {
+  on<K extends keyof MoonrakerEvents & string>(
+    event: K,
+    listener: (...args: MoonrakerEvents[K]) => void,
+  ): this;
+  once<K extends keyof MoonrakerEvents & string>(
+    event: K,
+    listener: (...args: MoonrakerEvents[K]) => void,
+  ): this;
+  off<K extends keyof MoonrakerEvents & string>(
+    event: K,
+    listener: (...args: MoonrakerEvents[K]) => void,
+  ): this;
+  emit<K extends keyof MoonrakerEvents & string>(
+    event: K,
+    ...args: MoonrakerEvents[K]
+  ): boolean;
+}
+
+/**
+ * Strongly-typed JSON-RPC websocket client for a Moonraker instance.
+ *
+ * The client opens a websocket immediately on construction, manages the
+ * heartbeat, and re-emits server traffic as typed events. Inherits from
+ * {@link https://nodejs.org/api/events.html#class-eventemitter | EventEmitter};
+ * see {@link MoonrakerEvents} for the full event map.
+ *
+ * @remarks
+ * Events of interest:
+ * - `'open'` — websocket established. Fire-and-forget your first requests here.
+ * - `'close'` — websocket closed. Args: `[code, reason]`.
+ * - `'error'` — transport or parse error. Args: `[Error]`.
+ * - `'notify:status_update'` — convenience event for subscription deltas.
+ *   Args: `[status, eventtime]`.
+ * - `` `response:${id}` `` — single JSON-RPC reply for a given request id.
+ * - `` `method:${name}` `` — any server-pushed JSON-RPC notification.
+ *
+ * @example
+ * Basic connect, query, and clean shutdown:
+ * ```ts
+ * import { MoonrakerClient } from 'moonraker-client';
+ *
+ * const client = new MoonrakerClient({
+ *   API: { connection: { server: '192.168.0.96', port: 7125 } },
+ * });
+ *
+ * client.on('open', async () => {
+ *   const info = await client.getServerInfo();
+ *   console.log(info);
+ *   client.close();
+ * });
+ *
+ * client.on('error', (err) => console.error(err));
+ * ```
+ *
+ * @example
+ * Subscribe to live extruder + bed temperatures:
+ * ```ts
+ * client.on('open', async () => {
+ *   await client.subscribe({
+ *     extruder:   ['temperature', 'target'],
+ *     heater_bed: ['temperature', 'target'],
+ *   });
+ * });
+ *
+ * client.on('notify:status_update', (status, eventtime) => {
+ *   console.log(eventtime, status.extruder?.temperature);
+ * });
+ * ```
+ *
+ * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/ | Moonraker Web API}
+ */
+export class MoonrakerClient extends EventEmitter {
+  readonly #config: ConnectionConfig;
+  readonly #wsOptions: ClientOptions;
+  readonly #wsURL: string;
+  readonly #heartbeatTimeoutMs: number;
+
+  #ws: WebSocket;
+  #pingTimeout: NodeJS.Timeout | null = null;
+  #requestCounter = 0;
+
+  /**
+   * Construct the client and open the websocket. The connection is asynchronous;
+   * wait for the `'open'` event (or check {@link isOpen}) before issuing requests.
+   *
+   * @param config - Connection settings. Only `API.connection.server` is required;
+   *   `port` defaults to `80` and `path` to `'/websocket'`.
+   * @param options - Optional client tuning.
+   * @param options.heartbeatTimeoutMs - How long to wait between pings before
+   *   force-terminating the socket. Defaults to `31000`.
+   * @throws {@link Error} if `config.API.connection` is missing or `server` is empty.
+   *
+   * @example
+   * ```ts
+   * const client = new MoonrakerClient({
+   *   API: {
+   *     connection: { server: '192.168.0.96', port: 7125, path: '/websocket' },
+   *   },
+   * });
+   * ```
+   */
+  constructor(config: ClientConfig, options: { heartbeatTimeoutMs?: number } = {}) {
+    super();
+    const connection = config?.API?.connection;
+    if (!connection) {
+      throw new Error('No API.connection found in config');
+    }
+
+    this.#config = connection;
+    this.#heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_MS;
+    this.#wsOptions = { handshakeTimeout: DEFAULT_HANDSHAKE_TIMEOUT_MS };
+    this.#wsURL = MoonrakerClient.#buildUrl(connection);
+    this.#ws = this.#openSocket();
+  }
+
+  /**
+   * The connection settings the client was constructed with. Read-only.
+   *
+   * @returns The resolved {@link ConnectionConfig}.
+   *
+   * @example
+   * ```ts
+   * console.log(client.config.server); // '192.168.0.96'
+   * ```
+   */
+  get config(): ConnectionConfig {
+    return this.#config;
+  }
+
+  /**
+   * Current websocket readyState, as defined by the WebSocket spec.
+   *
+   * @returns One of `SocketState.CONNECTING`, `OPEN`, `CLOSING`, `CLOSED`.
+   *
+   * @example
+   * ```ts
+   * import { SocketState } from 'moonraker-client';
+   * if (client.readyState === SocketState.OPEN) { /* ... *\/ }
+   * ```
+   */
+  get readyState(): SocketStateValue {
+    return this.#ws.readyState;
+  }
+
+  /**
+   * Convenience check for the most common state.
+   *
+   * @returns `true` iff the websocket is in the `OPEN` state.
+   *
+   * @example
+   * ```ts
+   * if (!client.isOpen) await once(client, 'open');
+   * await client.request('printer.info');
+   * ```
+   */
+  get isOpen(): boolean {
+    return this.readyState === SocketState.OPEN;
+  }
+
+  // --- Public API -----------------------------------------------------------
+
+  /**
+   * Send a JSON-RPC 2.0 request and resolve with the unwrapped `result` payload.
+   * Auto-assigns a unique request id and routes the matching reply back via the
+   * internal `` `response:${id}` `` event.
+   *
+   * @typeParam T - Expected shape of the response `result`. Defaults to `unknown`.
+   * @param method - JSON-RPC method name (e.g. `'printer.info'`).
+   * @param params - Optional parameters object passed through as `params`.
+   * @returns A promise that resolves with the response's `result`, or rejects
+   *   with a {@link MoonrakerError} carrying the JSON-RPC error code.
+   * @throws {@link MoonrakerError} for JSON-RPC error responses.
+   * @throws {@link Error} for transport errors.
+   *
+   * @example
+   * ```ts
+   * // Generic call:
+   * const info = await client.request<{ version: string }>('server.info');
+   *
+   * // With params:
+   * const meta = await client.request('server.files.metadata', {
+   *   filename: 'benchy.gcode',
+   * });
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#json-rpc-api-overview | JSON-RPC API overview}
+   */
+  request<T = unknown>(method: string, params?: unknown): Promise<T> {
+    const { promise, resolve, reject } = Promise.withResolvers<T>();
+
+    const id = ++this.#requestCounter;
+    const payload: JsonRpcRequest = { jsonrpc: '2.0', method, id };
+    if (params !== undefined) payload.params = params;
+
+    this.once(`response:${id}`, (msg) => {
+      if (isJsonRpcErrorResponse(msg)) {
+        reject(new MoonrakerError(msg.error.message, msg.error.code, msg.error.data));
+        return;
+      }
+      // The caller's chosen `T` is a runtime assertion about the server's
+      // response shape — TS can't validate it for us. This is the only place
+      // we apply that assertion, at the API boundary.
+      resolve(msg.result as T);
+    });
+
+    this.#send(payload).catch(reject);
+
+    return promise;
+  }
+
+  /**
+   * Subscribe to live status updates for one or more printer objects. The
+   * returned promise resolves with the *initial* snapshot; subsequent changes
+   * arrive as `'notify:status_update'` events.
+   *
+   * @remarks
+   * Moonraker only pushes updates when a value *changes*. For dense
+   * historical data, also call {@link getTemperatureStore}.
+   *
+   * @param spec - Which objects (and optionally which fields) to subscribe to.
+   *   Accepts a string, an array of names, or an object mapping object name
+   *   to a field list (or `null` for all fields). See {@link PrinterObjectSpec}.
+   * @returns A promise resolving to the initial `{ eventtime, status }` snapshot.
+   * @throws {@link MoonrakerError} if the server rejects the request.
+   *
+   * @example
+   * Subscribe to extruder + bed temperatures and listen for updates:
+   * ```ts
+   * await client.subscribe({
+   *   extruder:   ['temperature', 'target'],
+   *   heater_bed: ['temperature', 'target'],
+   * });
+   *
+   * client.on('notify:status_update', (status, eventtime) => {
+   *   console.log(eventtime, status.extruder?.temperature);
+   * });
+   * ```
+   *
+   * @example
+   * Subscribe to every field of a single object:
+   * ```ts
+   * await client.subscribe('toolhead');
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#subscribe-to-printer-object-status | Subscribe to Printer Object Status}
+   */
+  subscribe(spec: PrinterObjectSpec): Promise<SubscribeResult> {
+    return this.request<SubscribeResult>('printer.objects.subscribe', {
+      objects: normalizeObjectSpec(spec),
+    });
+  }
+
+  /**
+   * Cancel the websocket's active subscription by sending an empty objects map.
+   *
+   * @returns A promise resolving to Moonraker's confirmation snapshot
+   *   (`{ eventtime, status: {} }`).
+   * @throws {@link MoonrakerError} if the request fails.
+   *
+   * @example
+   * ```ts
+   * await client.unsubscribe();
+   * ```
+   */
+  unsubscribe(): Promise<SubscribeResult> {
+    return this.request<SubscribeResult>('printer.objects.subscribe', { objects: {} });
+  }
+
+  /**
+   * Query the current state of one or more printer objects *once*, without
+   * subscribing. Same `spec` shapes as {@link subscribe}.
+   *
+   * @param spec - Which objects (and optionally which fields) to query.
+   * @returns A promise resolving to `{ eventtime, status }`.
+   * @throws {@link MoonrakerError} if the request fails.
+   *
+   * @example
+   * One-shot read of every attribute of `toolhead` and `print_stats`:
+   * ```ts
+   * const { status } = await client.queryObjects(['toolhead', 'print_stats']);
+   * console.log(status.toolhead);
+   * ```
+   *
+   * @example
+   * Just two fields of `toolhead`:
+   * ```ts
+   * const { status } = await client.queryObjects({
+   *   toolhead: ['position', 'print_time'],
+   * });
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#query-printer-object-status | Query Printer Object Status}
+   */
+  queryObjects(spec: PrinterObjectSpec): Promise<SubscribeResult> {
+    return this.request<SubscribeResult>('printer.objects.query', {
+      objects: normalizeObjectSpec(spec),
+    });
+  }
+
+  /**
+   * List the names of every printer object exposed by Klippy. Useful for
+   * discovering object names like `temperature_fan chamber_fan` or
+   * `gcode_macro START_PRINT`.
+   *
+   * @returns A promise resolving to `{ objects: string[] }`.
+   * @throws {@link MoonrakerError} if the request fails.
+   *
+   * @example
+   * ```ts
+   * const { objects } = await client.getObjectsList();
+   * const macros = objects
+   *   .filter((o) => o.startsWith('gcode_macro '))
+   *   .map((o) => o.slice('gcode_macro '.length));
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#list-available-printer-objects | List Available Printer Objects}
+   */
+  getObjectsList(): Promise<{ objects: string[] }> {
+    return this.request('printer.objects.list');
+  }
+
+  /**
+   * Fetch high-level Moonraker server info (version, registered components,
+   * api version, klippy state).
+   *
+   * @returns A promise resolving to the raw server.info payload.
+   * @throws {@link MoonrakerError} if the request fails.
+   *
+   * @example
+   * ```ts
+   * const info = await client.getServerInfo();
+   * console.log(info);
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#query-server-info | Query Server Info}
+   */
+  getServerInfo(): Promise<unknown> {
+    return this.request('server.info');
+  }
+
+  /**
+   * Fetch Klippy host information (state, hostname, software version).
+   *
+   * @returns A promise resolving to the raw printer.info payload.
+   * @throws {@link MoonrakerError} if the request fails.
+   *
+   * @example
+   * ```ts
+   * const info = await client.getPrinterInfo();
+   * console.log(info);
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#get-klippy-host-information | Get Klippy Host Information}
+   */
+  getPrinterInfo(): Promise<unknown> {
+    return this.request('printer.info');
+  }
+
+  /**
+   * Fetch the server-side rolling cache of temperature samples — recorded at
+   * 1Hz, defaulting to ~20 minutes of history per sensor. Each sensor returns
+   * `temperatures[]`, plus `targets[]` and `powers[]` (heaters) or `speeds[]`
+   * (temperature_fan) where applicable.
+   *
+   * Useful for seeding charts with backfilled history *before* live status
+   * updates begin arriving.
+   *
+   * @param options - Optional flags.
+   * @param options.includeMonitors - If `true`, includes any
+   *   `temperature_monitor` objects in the response.
+   * @returns A promise resolving to a {@link TemperatureStore} keyed by object name.
+   * @throws {@link MoonrakerError} if the request fails.
+   *
+   * @example
+   * Seed a chart with the last N samples:
+   * ```ts
+   * const store = await client.getTemperatureStore();
+   * const last10ExtruderTemps = store.extruder?.temperatures.slice(-10);
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#get-cached-temperature-data | Get Cached Temperature Data}
+   */
+  getTemperatureStore(
+    options: { includeMonitors?: boolean } = {},
+  ): Promise<TemperatureStore> {
+    const params =
+      options.includeMonitors !== undefined
+        ? { include_monitors: options.includeMonitors }
+        : undefined;
+    return this.request<TemperatureStore>('server.temperature_store', params);
+  }
+
+  /**
+   * Close the websocket. The {@link MoonrakerEvents | `close`} event fires when
+   * the connection is fully closed.
+   *
+   * @param code - Optional close code (per the WebSocket spec). Defaults to
+   *   `1005` (no status).
+   * @param reason - Optional human-readable reason string.
+   *
+   * @example
+   * ```ts
+   * process.on('SIGINT', () => client.close());
+   * client.on('close', (code, reason) => {
+   *   console.log(`closed: ${code} ${reason ?? ''}`);
+   *   process.exit(0);
+   * });
+   * ```
+   */
+  close(code?: number, reason?: string): void {
+    if (this.#pingTimeout !== null) {
+      clearTimeout(this.#pingTimeout);
+      this.#pingTimeout = null;
+    }
+    this.#ws.close(code, reason);
+  }
+
+  // --- Internal -------------------------------------------------------------
+
+  /**
+   * Open the underlying ws connection and wire its events through to the
+   * EventEmitter surface.
+   */
+  #openSocket(): WebSocket {
+    const ws = new WebSocket(this.#wsURL, this.#wsOptions);
+    ws.on('open', () => this.#handleOpen());
+    ws.on('message', (data: WebSocket.RawData) => this.#handleMessage(data));
+    ws.on('error', (err: Error) => this.emit('error', err));
+    ws.on('close', (code: number, reasonBuf: Buffer) =>
+      this.#handleClose(code, reasonBuf.toString('utf-8')),
+    );
+    ws.on('ping', () => this.#resetHeartbeat());
+    return ws;
+  }
+
+  /** Arm the heartbeat watchdog and emit `'open'`. */
+  #handleOpen(): void {
+    this.#resetHeartbeat();
+    this.emit('open');
+  }
+
+  /** Cancel the heartbeat watchdog and emit `'close'`. */
+  #handleClose(code: number, reason: string): void {
+    if (this.#pingTimeout !== null) {
+      clearTimeout(this.#pingTimeout);
+      this.#pingTimeout = null;
+    }
+    this.emit('close', code, reason);
+  }
+
+  /**
+   * Parse an incoming frame and dispatch it as either a `response:${id}` event
+   * (replies) or a `method:${name}` event (server-pushed notifications). For
+   * the special `notify_status_update` method, additionally fire the
+   * convenience `'notify:status_update'` event with `[status, eventtime]`.
+   */
+  #handleMessage(data: WebSocket.RawData): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data.toString());
+    } catch (err) {
+      this.emit('error', err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+
+    if (!isJsonRpcMessage(parsed)) return;
+
+    if (isJsonRpcResponse(parsed)) {
+      this.emit(`response:${parsed.id}`, parsed);
+      return;
+    }
+
+    if (isJsonRpcNotification(parsed)) {
+      this.emit(`method:${parsed.method}`, parsed.params);
+      if (parsed.method === 'notify_status_update' && isStatusUpdateParams(parsed.params)) {
+        this.emit('notify:status_update', parsed.params[0], parsed.params[1]);
+      }
+    }
+  }
+
+  /**
+   * (Re-)arm the heartbeat timeout. If no `ping` arrives within
+   * `heartbeatTimeoutMs`, the socket is hard-terminated.
+   */
+  #resetHeartbeat(): void {
+    if (this.#pingTimeout !== null) clearTimeout(this.#pingTimeout);
+    this.#pingTimeout = setTimeout(() => this.#ws.terminate(), this.#heartbeatTimeoutMs);
+  }
+
+  /** Send a single frame, rejecting if the socket is not open. */
+  async #send(payload: JsonRpcRequest): Promise<void> {
+    if (this.#ws.readyState !== SocketState.OPEN) {
+      throw new Error(`Cannot send: websocket not open (state ${this.#ws.readyState})`);
+    }
+    const buf = Buffer.from(JSON.stringify(payload), 'utf-8');
+    await new Promise<void>((resolve, reject) => {
+      this.#ws.send(buf, (err) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  /** Build the `ws://host:port/path` URL from a {@link ConnectionConfig}. */
+  static #buildUrl(cfg: ConnectionConfig): string {
+    if (!cfg.server) throw new Error('No websocket server specified in connection config');
+    const port = cfg.port ?? 80;
+    const path = cfg.path ?? '/websocket';
+    return `ws://${cfg.server}:${port}${path}`;
+  }
+}
