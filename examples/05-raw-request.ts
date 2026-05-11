@@ -8,8 +8,8 @@
  * Run with:
  *   pnpm example examples/05-raw-request.ts
  */
-import { MoonrakerClient } from '../src/index.js';
-import { config } from './_config.js';
+import { MoonrakerClient } from '../src/index';
+import { config } from './_config';
 
 interface PrinterInfo {
   readonly state: string;

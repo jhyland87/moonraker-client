@@ -6,7 +6,7 @@
  *
  *   MOONRAKER_HOST=192.168.1.50 pnpm example examples/01-server-info.ts
  */
-import type { ClientConfig } from '../src/index.js';
+import type { ClientConfig } from '../src/index';
 
 export const config: ClientConfig = {
   API: {

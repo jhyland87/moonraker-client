@@ -21,8 +21,8 @@
     "src"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsup",
+    "typecheck": "tsc -p tsconfig.json",
     "typecheck:examples": "tsc -p tsconfig.examples.json",
     "clean": "rm -rf dist docs",
     "example": "node",
@@ -35,6 +35,7 @@
   "devDependencies": {
     "@types/node": "^25.7.0",
     "@types/ws": "^8.5.13",
+    "tsup": "^8.5.1",
     "typedoc": "^0.28.0",
     "typedoc-plugin-coverage": "^4.0.3",
     "typedoc-plugin-dt-links": "^2.0.54",

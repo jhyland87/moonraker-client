@@ -12,8 +12,8 @@
  * Run with:
  *   pnpm example examples/02-query-status.ts
  */
-import { MoonrakerClient } from '../src/index.js';
-import { config } from './_config.js';
+import { MoonrakerClient } from '../src/index';
+import { config } from './_config';
 
 const client = new MoonrakerClient(config);
 

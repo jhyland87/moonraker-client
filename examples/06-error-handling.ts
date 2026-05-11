@@ -10,8 +10,8 @@
  * Run with:
  *   pnpm example examples/06-error-handling.ts
  */
-import { MoonrakerClient, MoonrakerError } from '../src/index.js';
-import { config } from './_config.js';
+import { MoonrakerClient, MoonrakerError } from '../src/index';
+import { config } from './_config';
 
 const client = new MoonrakerClient(config);
 

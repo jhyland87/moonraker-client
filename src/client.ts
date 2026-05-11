@@ -1,16 +1,16 @@
 import { EventEmitter } from 'node:events';
 import WebSocket, { type ClientOptions } from 'ws';
 
-import { MoonrakerError } from './errors.js';
-import type { MoonrakerEvents } from './events.js';
+import { MoonrakerError } from './errors';
+import type { MoonrakerEvents } from './events';
 import {
   isJsonRpcErrorResponse,
   isJsonRpcMessage,
   isJsonRpcNotification,
   isJsonRpcResponse,
   isStatusUpdateParams,
-} from './guards.js';
-import { SocketState, type SocketStateValue } from './socket-states.js';
+} from './guards';
+import { SocketState, type SocketStateValue } from './socket-states';
 import {
   type ClientConfig,
   type ConnectionConfig,
@@ -18,7 +18,7 @@ import {
   type PrinterObjectSpec,
   type SubscribeResult,
   type TemperatureStore,
-} from './types.js';
+} from './types';
 
 const DEFAULT_HEARTBEAT_MS = 31_000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 1_000;
@@ -502,21 +502,21 @@ export class MoonrakerClient extends EventEmitter {
    * Arm the heartbeat watchdog and emit `'open'`.
    * @source
    */
-  #handleOpen(): void {
+  #handleOpen(): boolean {
     this.#resetHeartbeat();
-    this.emit('open');
+    return this.emit('open');
   }
 
   /**
    * Cancel the heartbeat watchdog and emit `'close'`.
    * @source
    */
-  #handleClose(code: number, reason: string): void {
+  #handleClose(code: number, reason: string): boolean {
     if (this.#pingTimeout !== null) {
       clearTimeout(this.#pingTimeout);
       this.#pingTimeout = null;
     }
-    this.emit('close', code, reason);
+    return this.emit('close', code, reason);
   }
 
   /**

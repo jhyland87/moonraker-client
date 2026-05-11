@@ -2,7 +2,7 @@ import type {
   JsonRpcErrorResponse,
   JsonRpcSuccessResponse,
   PrinterStatus,
-} from './types.js';
+} from './types';
 
 /**
  * Strongly-typed event map for the MoonrakerClient EventEmitter.

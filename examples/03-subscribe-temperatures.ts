@@ -8,8 +8,8 @@
  * Run until Ctrl+C:
  *   pnpm example examples/03-subscribe-temperatures.ts
  */
-import { MoonrakerClient } from '../src/index.js';
-import { config } from './_config.js';
+import { MoonrakerClient } from '../src/index';
+import { config } from './_config';
 
 const client = new MoonrakerClient(config);
 

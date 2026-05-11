@@ -10,7 +10,7 @@ import type {
   JsonRpcNotification,
   JsonRpcSuccessResponse,
   PrinterStatus,
-} from './types.js';
+} from './types';
 
 /**
  * True for anything that looks structurally like a JSON-RPC 2.0 message.

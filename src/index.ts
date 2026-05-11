@@ -1,15 +1,15 @@
-export { MoonrakerClient } from './client.js';
-export { MoonrakerError } from './errors.js';
+export { MoonrakerClient } from './client';
+export { MoonrakerError } from './errors';
 export {
   isJsonRpcErrorResponse,
   isJsonRpcMessage,
   isJsonRpcNotification,
   isJsonRpcResponse,
   isStatusUpdateParams,
-} from './guards.js';
-export { SocketState, describeSocketState } from './socket-states.js';
-export type { SocketStateValue } from './socket-states.js';
-export type { MoonrakerEvents } from './events.js';
+} from './guards';
+export { SocketState, describeSocketState } from './socket-states';
+export type { SocketStateValue } from './socket-states';
+export type { MoonrakerEvents } from './events';
 export type {
   ClientConfig,
   ConnectionConfig,
@@ -25,4 +25,4 @@ export type {
   SubscribeResult,
   TemperatureStore,
   TemperatureStoreSensor,
-} from './types.js';
+} from './types';
