@@ -454,6 +454,39 @@ export class MoonrakerClient extends EventEmitter {
   }
 
   /**
+   * Fetch the trailing bytes of a Moonraker-served log file over HTTP.
+   *
+   * Uses an HTTP `Range: bytes=-N` request against `/server/files/<name>` on
+   * the same host/port as the websocket. A 206 response usually starts mid-line;
+   * everything up to the first newline is discarded so callers always receive
+   * whole lines.
+   *
+   * @param name - Log filename. Defaults to `'klippy.log'`.
+   * @param bytes - Maximum trailing bytes to request. Defaults to `50_000`.
+   * @returns The decoded UTF-8 text, with a leading partial line trimmed on 206.
+   * @throws {@link MoonrakerError} for non-2xx HTTP responses.
+   *
+   * @example
+   * ```ts
+   * const tail = await client.getLogTail('klippy.log', 50_000);
+   * for (const line of tail.split('\n')) { /* ... *\/ }
+   * ```
+   * @source
+   */
+  async getLogTail(name: string = 'klippy.log', bytes: number = 50_000): Promise<string> {
+    const port = this.#config.port ?? 80;
+    const url = `http://${this.#config.server}:${port}/server/files/${name}`;
+    const res = await fetch(url, { headers: { Range: `bytes=-${bytes}` } });
+    if (!res.ok && res.status !== 206) {
+      throw new MoonrakerError(`getLogTail ${name}: HTTP ${res.status}`, res.status);
+    }
+    const text = await res.text();
+    if (res.status !== 206) return text;
+    const nl = text.indexOf('\n');
+    return nl >= 0 ? text.slice(nl + 1) : text;
+  }
+
+  /**
    * Close the websocket. The {@link MoonrakerEvents | `close`} event fires when
    * the connection is fully closed.
    *
