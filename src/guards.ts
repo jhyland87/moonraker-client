@@ -58,3 +58,24 @@ export const isStatusUpdateParams = (value: unknown): value is [PrinterStatus, n
   typeof value[0] === 'object' &&
   value[0] !== null &&
   typeof value[1] === 'number';
+
+/**
+ * The `params` shape of a `notify_gcode_response` notification: a 1-element
+ * array `[message]`. Moonraker emits one of these for every gcode response
+ * line (echoes, M118 messages, errors, etc.).
+ * @source
+ */
+export const isGcodeResponseParams = (value: unknown): value is [string] =>
+  Array.isArray(value) && value.length >= 1 && typeof value[0] === 'string';
+
+/**
+ * The `params` shape of a `notify_proc_stat_update` notification: a 1-element
+ * array containing a stats object (moonraker_stats, cpu_temp, network, etc.).
+ * Validated structurally only — consumers narrow the inner fields.
+ * @source
+ */
+export const isProcStatUpdateParams = (value: unknown): value is [Record<string, unknown>] =>
+  Array.isArray(value) &&
+  value.length >= 1 &&
+  typeof value[0] === 'object' &&
+  value[0] !== null;

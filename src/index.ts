@@ -1,10 +1,12 @@
 export { MoonrakerClient } from './client';
 export { MoonrakerError } from './errors';
 export {
+  isGcodeResponseParams,
   isJsonRpcErrorResponse,
   isJsonRpcMessage,
   isJsonRpcNotification,
   isJsonRpcResponse,
+  isProcStatUpdateParams,
   isStatusUpdateParams,
 } from './guards';
 export { SocketState, describeSocketState } from './socket-states';

@@ -4,10 +4,12 @@ import WebSocket, { type ClientOptions } from 'ws';
 import { MoonrakerError } from './errors';
 import type { MoonrakerEvents } from './events';
 import {
+  isGcodeResponseParams,
   isJsonRpcErrorResponse,
   isJsonRpcMessage,
   isJsonRpcNotification,
   isJsonRpcResponse,
+  isProcStatUpdateParams,
   isStatusUpdateParams,
 } from './guards';
 import { SocketState, type SocketStateValue } from './socket-states';
@@ -560,6 +562,12 @@ export class MoonrakerClient extends EventEmitter {
    * @source
    */
   #handleMessage(data: WebSocket.RawData): void {
+    // Any inbound traffic counts as liveness — Moonraker streams JSON
+    // notifications continuously but doesn't send WebSocket-level PING
+    // frames, so a ping-only heartbeat would terminate a perfectly healthy
+    // connection after `heartbeatTimeoutMs`.
+    this.#resetHeartbeat();
+
     let parsed: unknown;
     try {
       parsed = JSON.parse(data.toString());
@@ -579,13 +587,24 @@ export class MoonrakerClient extends EventEmitter {
       this.emit(`method:${parsed.method}`, parsed.params);
       if (parsed.method === 'notify_status_update' && isStatusUpdateParams(parsed.params)) {
         this.emit('notify:status_update', parsed.params[0], parsed.params[1]);
+      } else if (
+        parsed.method === 'notify_gcode_response' &&
+        isGcodeResponseParams(parsed.params)
+      ) {
+        this.emit('notify:gcode_response', parsed.params[0]);
+      } else if (
+        parsed.method === 'notify_proc_stat_update' &&
+        isProcStatUpdateParams(parsed.params)
+      ) {
+        this.emit('notify:proc_stat_update', parsed.params[0]);
       }
     }
   }
 
   /**
-   * (Re-)arm the heartbeat timeout. If no `ping` arrives within
-   * `heartbeatTimeoutMs`, the socket is hard-terminated.
+   * (Re-)arm the heartbeat timeout. Reset on any inbound traffic — server
+   * `ping` frames *and* regular JSON messages — so the socket is only
+   * terminated when the server actually goes silent for `heartbeatTimeoutMs`.
    * @source
    */
   #resetHeartbeat(): void {

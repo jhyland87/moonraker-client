@@ -18,6 +18,8 @@ export interface MoonrakerEvents {
   close: [code: number | undefined, reason: string | undefined];
   error: [error: Error];
   'notify:status_update': [status: PrinterStatus, eventtime: number];
+  'notify:gcode_response': [message: string];
+  'notify:proc_stat_update': [stats: Record<string, unknown>];
   // String-indexed signals for dynamic response/method events
   [key: `response:${number}`]: [JsonRpcSuccessResponse | JsonRpcErrorResponse];
   [key: `method:${string}`]: [params: unknown];
