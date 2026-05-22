@@ -22,13 +22,52 @@ import {
   type TemperatureStore,
 } from './types';
 
+/** Default heartbeat timeout (ms) — see {@link MoonrakerClient.resetHeartbeat}. */
 const DEFAULT_HEARTBEAT_MS = 31_000;
+
+/** Default handshake timeout passed to the underlying `ws` `WebSocket`. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 1_000;
 
-// `Array.isArray` doesn't narrow `readonly T[]` out of a union (TS issue
-// #17002), so we wrap it in our own predicate that promises the correct type.
+/**
+ * Like `Array.isArray` but narrows to `readonly string[]` instead of
+ * widening to `any[]`. Used to keep TypeScript's union narrowing
+ * accurate across {@link PrinterObjectSpec}.
+ *
+ * `Array.isArray` doesn't narrow `readonly T[]` out of a union (TS
+ * issue #17002), so we wrap it in our own predicate.
+ *
+ * @param v - Any value.
+ * @returns `true` iff `v` is an array (typed as a readonly string array).
+ * @source
+ */
 const isReadonlyStringArray = (v: unknown): v is readonly string[] => Array.isArray(v);
 
+/**
+ * Coerce any of the three accepted {@link PrinterObjectSpec} shorthand
+ * shapes into the canonical object-map form
+ * (`{ [name]: fieldList | null }`) the Moonraker wire protocol
+ * expects.
+ *
+ * - A string `name` becomes `{ [name]: null }`.
+ * - An array of names becomes `{ [name]: null }` for each entry.
+ * - An object map is returned unchanged.
+ *
+ * @param spec - One of the {@link PrinterObjectSpec} shorthand shapes.
+ * @returns The fully-expanded object map.
+ *
+ * @example
+ * ```ts
+ * normalizeObjectSpec('toolhead');
+ * // → { toolhead: null }
+ *
+ * normalizeObjectSpec(['toolhead', 'print_stats']);
+ * // → { toolhead: null, print_stats: null }
+ *
+ * normalizeObjectSpec({ extruder: ['temperature'] });
+ * // → { extruder: ['temperature'] }
+ * ```
+ * @source
+ */
 const normalizeObjectSpec = (
   spec: PrinterObjectSpec,
 ): Record<string, readonly string[] | null> => {
@@ -78,10 +117,10 @@ export interface MoonrakerClient {
  *
  * @remarks
  * Events of interest:
- * - `'open'` — websocket established. Fire-and-forget your first requests here.
- * - `'close'` — websocket closed. Args: `[code, reason]`.
- * - `'error'` — transport or parse error. Args: `[Error]`.
- * - `'notify:status_update'` — convenience event for subscription deltas.
+ * - `open` — websocket established. Fire-and-forget your first requests here.
+ * - `close` — websocket closed. Args: `[code, reason]`.
+ * - `error` — transport or parse error. Args: `[Error]`.
+ * - `notify:status_update` — convenience event for subscription deltas.
  *   Args: `[status, eventtime]`.
  * - `` `response:${id}` `` — single JSON-RPC reply for a given request id.
  * - `` `method:${name}` `` — any server-pushed JSON-RPC notification.
@@ -123,21 +162,29 @@ export interface MoonrakerClient {
  * @source
  */
 export class MoonrakerClient extends EventEmitter {
-  readonly #config: ConnectionConfig;
-  readonly #wsOptions: ClientOptions;
-  readonly #wsURL: string;
-  readonly #heartbeatTimeoutMs: number;
+  /**
+   * The connection settings the client was constructed with. Surfaced as
+   * a public `readonly` field rather than a pass-through getter (which
+   * Google's style guide flags as an anti-pattern for accessor-only
+   * properties).
+   * @source
+   */
+  readonly config: ConnectionConfig;
 
-  #ws: WebSocket;
-  #pingTimeout: NodeJS.Timeout | null = null;
-  #requestCounter = 0;
+  private readonly wsOptions: ClientOptions;
+  private readonly wsURL: string;
+  private readonly heartbeatTimeoutMs: number;
+
+  private ws: WebSocket;
+  private pingTimeout: NodeJS.Timeout | null = null;
+  private requestCounter = 0;
 
   /**
    * Construct the client and open the websocket. The connection is asynchronous;
-   * wait for the `'open'` event (or check {@link isOpen}) before issuing requests.
+   * wait for the `open` event (or check {@link isOpen}) before issuing requests.
    *
    * @param config - Connection settings. Only `API.connection.server` is required;
-   *   `port` defaults to `80` and `path` to `'/websocket'`.
+   *   `port` defaults to `80` and `path` to `/websocket`.
    * @param options - Optional client tuning.
    * @param options.heartbeatTimeoutMs - How long to wait between pings before
    *   force-terminating the socket. Defaults to `31000`.
@@ -160,26 +207,11 @@ export class MoonrakerClient extends EventEmitter {
       throw new Error('No API.connection found in config');
     }
 
-    this.#config = connection;
-    this.#heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_MS;
-    this.#wsOptions = { handshakeTimeout: DEFAULT_HANDSHAKE_TIMEOUT_MS };
-    this.#wsURL = MoonrakerClient.#buildUrl(connection);
-    this.#ws = this.#openSocket();
-  }
-
-  /**
-   * The connection settings the client was constructed with. Read-only.
-   *
-   * @returns The resolved {@link ConnectionConfig}.
-   *
-   * @example
-   * ```ts
-   * console.log(client.config.server); // '192.168.0.96'
-   * ```
-   * @source
-   */
-  get config(): ConnectionConfig {
-    return this.#config;
+    this.config = connection;
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_MS;
+    this.wsOptions = { handshakeTimeout: DEFAULT_HANDSHAKE_TIMEOUT_MS };
+    this.wsURL = MoonrakerClient.buildUrl(connection);
+    this.ws = this.openSocket();
   }
 
   /**
@@ -195,7 +227,7 @@ export class MoonrakerClient extends EventEmitter {
    * @source
    */
   get readyState(): SocketStateValue {
-    return this.#ws.readyState;
+    return this.ws.readyState;
   }
 
   /**
@@ -222,7 +254,7 @@ export class MoonrakerClient extends EventEmitter {
    * internal `` `response:${id}` `` event.
    *
    * @typeParam T - Expected shape of the response `result`. Defaults to `unknown`.
-   * @param method - JSON-RPC method name (e.g. `'printer.info'`).
+   * @param method - JSON-RPC method name (e.g. `printer.info`).
    * @param params - Optional parameters object passed through as `params`.
    * @returns A promise that resolves with the response's `result`, or rejects
    *   with a {@link MoonrakerError} carrying the JSON-RPC error code.
@@ -246,7 +278,7 @@ export class MoonrakerClient extends EventEmitter {
   request<T = unknown>(method: string, params?: unknown): Promise<T> {
     const { promise, resolve, reject } = Promise.withResolvers<T>();
 
-    const id = ++this.#requestCounter;
+    const id = ++this.requestCounter;
     const payload: JsonRpcRequest = { jsonrpc: '2.0', method, id };
     if (params !== undefined) payload.params = params;
 
@@ -261,7 +293,7 @@ export class MoonrakerClient extends EventEmitter {
       resolve(msg.result as T);
     });
 
-    this.#send(payload).catch(reject);
+    this.send(payload).catch(reject);
 
     return promise;
   }
@@ -269,7 +301,7 @@ export class MoonrakerClient extends EventEmitter {
   /**
    * Subscribe to live status updates for one or more printer objects. The
    * returned promise resolves with the *initial* snapshot; subsequent changes
-   * arrive as `'notify:status_update'` events.
+   * arrive as `notify:status_update` events.
    *
    * @remarks
    * Moonraker only pushes updates when a value *changes*. For dense
@@ -463,7 +495,7 @@ export class MoonrakerClient extends EventEmitter {
    * everything up to the first newline is discarded so callers always receive
    * whole lines.
    *
-   * @param name - Log filename. Defaults to `'klippy.log'`.
+   * @param name - Log filename. Defaults to `klippy.log`.
    * @param bytes - Maximum trailing bytes to request. Defaults to `50_000`.
    * @returns The decoded UTF-8 text, with a leading partial line trimmed on 206.
    * @throws {@link MoonrakerError} for non-2xx HTTP responses.
@@ -476,8 +508,8 @@ export class MoonrakerClient extends EventEmitter {
    * @source
    */
   async getLogTail(name: string = 'klippy.log', bytes: number = 50_000): Promise<string> {
-    const port = this.#config.port ?? 80;
-    const url = `http://${this.#config.server}:${port}/server/files/${name}`;
+    const port = this.config.port ?? 80;
+    const url = `http://${this.config.server}:${port}/server/files/${name}`;
     const res = await fetch(url, { headers: { Range: `bytes=-${bytes}` } });
     if (!res.ok && res.status !== 206) {
       throw new MoonrakerError(`getLogTail ${name}: HTTP ${res.status}`, res.status);
@@ -507,66 +539,100 @@ export class MoonrakerClient extends EventEmitter {
    * @source
    */
   close(code?: number, reason?: string): void {
-    if (this.#pingTimeout !== null) {
-      clearTimeout(this.#pingTimeout);
-      this.#pingTimeout = null;
+    if (this.pingTimeout !== null) {
+      clearTimeout(this.pingTimeout);
+      this.pingTimeout = null;
     }
-    this.#ws.close(code, reason);
+    this.ws.close(code, reason);
   }
 
   // --- Internal -------------------------------------------------------------
 
   /**
-   * Open the underlying ws connection and wire its events through to the
-   * EventEmitter surface.
+   * Open the underlying `ws` WebSocket and wire its lifecycle events
+   * through to this class's typed `EventEmitter` surface.
+   *
+   * Listeners installed here stay attached for the socket's lifetime;
+   * the corresponding {@link close} or terminate cleans them up when
+   * the underlying connection is closed and garbage-collected.
+   *
+   * @returns The freshly-constructed `WebSocket` instance, already
+   *   wired with `open` / `message` / `error` / `close` / `ping`
+   *   handlers.
    * @source
    */
-  #openSocket(): WebSocket {
-    const ws = new WebSocket(this.#wsURL, this.#wsOptions);
-    ws.on('open', () => this.#handleOpen());
-    ws.on('message', (data: WebSocket.RawData) => this.#handleMessage(data));
+  private openSocket(): WebSocket {
+    const ws = new WebSocket(this.wsURL, this.wsOptions);
+    ws.on('open', () => this.handleOpen());
+    ws.on('message', (data: WebSocket.RawData) => this.handleMessage(data));
     ws.on('error', (err: Error) => this.emit('error', err));
     ws.on('close', (code: number, reasonBuf: Buffer) =>
-      this.#handleClose(code, reasonBuf.toString('utf-8')),
+      this.handleClose(code, reasonBuf.toString('utf-8')),
     );
-    ws.on('ping', () => this.#resetHeartbeat());
+    ws.on('ping', () => this.resetHeartbeat());
     return ws;
   }
 
   /**
-   * Arm the heartbeat watchdog and emit `'open'`.
+   * Handler for the underlying `ws`'s `open` event. Arms the heartbeat
+   * watchdog (so a server-side hang trips a reconnect) and re-emits
+   * `'open'` on the typed event surface.
+   *
+   * @returns The boolean result of `EventEmitter.emit` — `true` if any
+   *   listener handled `'open'`, `false` otherwise.
    * @source
    */
-  #handleOpen(): boolean {
-    this.#resetHeartbeat();
+  private handleOpen(): boolean {
+    this.resetHeartbeat();
     return this.emit('open');
   }
 
   /**
-   * Cancel the heartbeat watchdog and emit `'close'`.
+   * Handler for the underlying `ws`'s `close` event. Cancels the
+   * heartbeat watchdog and re-emits `'close'` with the WS-level close
+   * code and reason string.
+   *
+   * @param code - The WebSocket close code (per RFC 6455).
+   * @param reason - The optional human-readable close reason.
+   * @returns The boolean result of `EventEmitter.emit` — `true` if any
+   *   listener handled `'close'`, `false` otherwise.
    * @source
    */
-  #handleClose(code: number, reason: string): boolean {
-    if (this.#pingTimeout !== null) {
-      clearTimeout(this.#pingTimeout);
-      this.#pingTimeout = null;
+  private handleClose(code: number, reason: string): boolean {
+    if (this.pingTimeout !== null) {
+      clearTimeout(this.pingTimeout);
+      this.pingTimeout = null;
     }
     return this.emit('close', code, reason);
   }
 
   /**
-   * Parse an incoming frame and dispatch it as either a `response:${id}` event
-   * (replies) or a `method:${name}` event (server-pushed notifications). For
-   * the special `notify_status_update` method, additionally fire the
-   * convenience `'notify:status_update'` event with `[status, eventtime]`.
+   * Handler for every inbound WebSocket frame.
+   *
+   * Parses the JSON payload and dispatches it as either a
+   * `response:${id}` event (for replies to {@link request}) or a
+   * `method:${name}` event (for server-pushed notifications). For the
+   * handful of notifications we have first-class typed convenience
+   * events for (`notify_status_update`, `notify_gcode_response`,
+   * `notify_proc_stat_update`), the typed variant is fired *in
+   * addition* to the generic `method:*` event.
+   *
+   * Every inbound frame also resets the heartbeat watchdog — Moonraker
+   * sends JSON notifications continuously but never WebSocket-level
+   * PING frames, so a ping-only watchdog would terminate healthy
+   * sockets.
+   *
+   * @param data - The raw `Buffer` / typed-array payload as received
+   *   from `ws`. Decoded with `toString()` and JSON-parsed; parse
+   *   errors are re-emitted as `'error'` events.
    * @source
    */
-  #handleMessage(data: WebSocket.RawData): void {
+  private handleMessage(data: WebSocket.RawData): void {
     // Any inbound traffic counts as liveness — Moonraker streams JSON
     // notifications continuously but doesn't send WebSocket-level PING
     // frames, so a ping-only heartbeat would terminate a perfectly healthy
     // connection after `heartbeatTimeoutMs`.
-    this.#resetHeartbeat();
+    this.resetHeartbeat();
 
     let parsed: unknown;
     try {
@@ -602,35 +668,55 @@ export class MoonrakerClient extends EventEmitter {
   }
 
   /**
-   * (Re-)arm the heartbeat timeout. Reset on any inbound traffic — server
-   * `ping` frames *and* regular JSON messages — so the socket is only
-   * terminated when the server actually goes silent for `heartbeatTimeoutMs`.
+   * (Re-)arm the heartbeat timeout. Called on every inbound frame so
+   * the socket is only terminated when the server actually goes silent
+   * for {@link MoonrakerClient.heartbeatTimeoutMs} consecutive ms —
+   * not on every period where the WS-level PING happens to be skipped.
+   *
+   * Clears any prior pending timeout before installing the new one, so
+   * repeated calls don't pile up handlers.
    * @source
    */
-  #resetHeartbeat(): void {
-    if (this.#pingTimeout !== null) clearTimeout(this.#pingTimeout);
-    this.#pingTimeout = setTimeout(() => this.#ws.terminate(), this.#heartbeatTimeoutMs);
+  private resetHeartbeat(): void {
+    if (this.pingTimeout !== null) clearTimeout(this.pingTimeout);
+    this.pingTimeout = setTimeout(() => this.ws.terminate(), this.heartbeatTimeoutMs);
   }
 
   /**
-   * Send a single frame, rejecting if the socket is not open.
+   * Serialize a JSON-RPC request and write it to the websocket.
+   *
+   * The promise resolves once the bytes have been handed off to the
+   * underlying `ws` (the success/error reply itself arrives later via
+   * `handleMessage` and the `response:${id}` event).
+   *
+   * @param payload - The frame to send. Caller is responsible for
+   *   assigning a unique `id`.
+   * @returns A promise that resolves on send-complete and rejects with
+   *   any transport-level error.
+   * @throws Error if the socket is not in {@link SocketState.OPEN}.
    * @source
    */
-  async #send(payload: JsonRpcRequest): Promise<void> {
-    if (this.#ws.readyState !== SocketState.OPEN) {
-      throw new Error(`Cannot send: websocket not open (state ${this.#ws.readyState})`);
+  private async send(payload: JsonRpcRequest): Promise<void> {
+    if (this.ws.readyState !== SocketState.OPEN) {
+      throw new Error(`Cannot send: websocket not open (state ${this.ws.readyState})`);
     }
     const buf = Buffer.from(JSON.stringify(payload), 'utf-8');
     await new Promise<void>((resolve, reject) => {
-      this.#ws.send(buf, (err) => (err ? reject(err) : resolve()));
+      this.ws.send(buf, (err) => (err ? reject(err) : resolve()));
     });
   }
 
   /**
-   * Build the `ws://host:port/path` URL from a {@link ConnectionConfig}.
+   * Compose the full `ws://host:port/path` URL from a
+   * {@link ConnectionConfig}. Applied once in the constructor and
+   * cached on the instance.
+   *
+   * @param cfg - The validated connection config.
+   * @returns The fully-qualified websocket URL string.
+   * @throws Error if `cfg.server` is empty or missing.
    * @source
    */
-  static #buildUrl(cfg: ConnectionConfig): string {
+  private static buildUrl(cfg: ConnectionConfig): string {
     if (!cfg.server) throw new Error('No websocket server specified in connection config');
     const port = cfg.port ?? 80;
     const path = cfg.path ?? '/websocket';
