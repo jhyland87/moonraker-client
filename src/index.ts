@@ -41,6 +41,10 @@ export type { MoonrakerEvents } from './events';
 export type {
   ClientConfig,
   ConnectionConfig,
+  FileEntry,
+  GcodeFileMetadata,
+  GcodeMetadataMap,
+  GcodeThumbnail,
   HeaterStatus,
   JsonRpcErrorPayload,
   JsonRpcErrorResponse,

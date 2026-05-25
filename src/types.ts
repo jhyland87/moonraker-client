@@ -24,6 +24,16 @@ export interface ConnectionConfig {
   /** WebSocket path on the server. Defaults to `'/websocket'` if omitted. */
   readonly path?: string;
   /**
+   * Use TLS when connecting. When `true`, the websocket uses `wss://` and
+   * the HTTP endpoints (e.g. {@link MoonrakerClient.getLogTail} and
+   * Moonraker file fetches like thumbnails) use `https://`. Defaults to
+   * `false` so existing plaintext setups don't break.
+   *
+   * Independent of any reverse-proxy or webcam server in front of the
+   * printer — each of those has its own protocol flag.
+   */
+  readonly secure?: boolean;
+  /**
    * Optional handshake timeout override (ms). Currently informational —
    * the client uses its own internal handshake timeout constant.
    */
@@ -256,3 +266,130 @@ export interface TemperatureStoreSensor {
  * @source
  */
 export type TemperatureStore = Readonly<Record<string, TemperatureStoreSensor>>;
+
+/**
+ * One thumbnail variant attached to a gcode file's metadata. Moonraker
+ * extracts these from the gcode's `; thumbnail` comments at upload time
+ * and stores them under `.thumbs/<name>-<W>x<H>.png` next to the gcode.
+ *
+ * The `relative_path` is relative to the gcode's directory in the gcode
+ * file root (typically `gcodes/`) — combine with the server's HTTP base
+ * URL to fetch: `http://<host>:<port>/server/files/gcodes/<relative_path>`.
+ *
+ * Slicers commonly emit three sizes (32×32, 100×100, 320×320); the
+ * 100×100 is usually the right one for a small inline preview.
+ *
+ * @example
+ * ```ts
+ * const meta = await client.getFileMetadata('print.gcode');
+ * const thumb = meta.thumbnails.find((t) => t.width >= 100) ?? meta.thumbnails[0];
+ * const url = `http://${host}:${port}/server/files/gcodes/${thumb.relative_path}`;
+ * ```
+ * @source
+ */
+export interface GcodeThumbnail {
+  /** Image width in pixels. */
+  readonly width: number;
+  /** Image height in pixels. */
+  readonly height: number;
+  /** File size in bytes. */
+  readonly size: number;
+  /** Path relative to the gcode file root, including any `.thumbs/` subdir. */
+  readonly relative_path: string;
+}
+
+/**
+ * Subset of fields returned by `server.files.metadata`. Moonraker returns
+ * a much larger object (filament weights, slicer name, layer count,
+ * estimated time, …); we expose the fields a dashboard is likely to use
+ * and leave room to add more as needed.
+ *
+ * @example
+ * Fetching for the currently-loaded job:
+ * ```ts
+ * const status = await client.request<{ print_stats: { filename: string } }>(
+ *   'printer.objects.query',
+ *   { objects: { print_stats: ['filename'] } },
+ * );
+ * const meta = await client.getFileMetadata(status.print_stats.filename);
+ * console.log(meta.thumbnails.length, 'thumbnails available');
+ * ```
+ * @source
+ */
+export interface GcodeFileMetadata {
+  /** Filename as Moonraker knows it (no leading `gcodes/`). */
+  readonly filename: string;
+  /** Available pre-rendered thumbnails, smallest first by Moonraker's convention. */
+  readonly thumbnails: readonly GcodeThumbnail[];
+  /** File size in bytes. */
+  readonly size?: number;
+  /** Slicer name (e.g. `OrcaSlicer`, `PrusaSlicer`, `SuperSlicer`). */
+  readonly slicer?: string;
+  /** Slicer version string. */
+  readonly slicer_version?: string;
+  /** Total layer count, when the slicer included it. */
+  readonly layer_count?: number;
+  /** Maximum Z value reached by the print, in mm. */
+  readonly object_height?: number;
+  /** Layer height in mm, per the slicer. */
+  readonly layer_height?: number;
+  /** First-layer height in mm, per the slicer. */
+  readonly first_layer_height?: number;
+  /** First-layer extruder temperature in °C. */
+  readonly first_layer_extr_temp?: number;
+  /** First-layer bed temperature in °C. */
+  readonly first_layer_bed_temp?: number;
+  /** Target chamber temperature in °C (0 = none). */
+  readonly chamber_temp?: number;
+  /** Nozzle diameter in mm. */
+  readonly nozzle_diameter?: number;
+  /** Estimated print duration in seconds, per the slicer. */
+  readonly estimated_time?: number;
+  /** Total filament used across all extruders, in mm. */
+  readonly filament_total?: number;
+  /** Total filament weight across all extruders, in grams. */
+  readonly filament_weight_total?: number;
+  /** Material type from the slicer (e.g. `"PLA"`, `"PETG"`, `"ABS"`). */
+  readonly filament_type?: string;
+  /** Display name of the loaded filament profile from the slicer. */
+  readonly filament_name?: string;
+  /** Unix-seconds timestamp of the most recent print start, if known. */
+  readonly print_start_time?: number | null;
+  /** Most-recent print job id (Moonraker's internal counter). */
+  readonly job_id?: string | null;
+}
+
+/**
+ * One entry as returned by `server.files.list` — a single regular file
+ * Moonraker has cataloged under the gcode root. `path` is the relative
+ * path from the root (e.g. `'subdir/print.gcode'`); `modified` is a
+ * Unix-seconds float; `size` is the byte count; `permissions` is the
+ * POSIX-style mode string (typically `'rw'`).
+ *
+ * @source
+ */
+export interface FileEntry {
+  readonly path: string;
+  readonly modified: number;
+  readonly size: number;
+  readonly permissions?: string;
+}
+
+/**
+ * Map of cached gcode metadata keyed by filename — the shape returned
+ * by `server.database.item` with `namespace: 'gcode_metadata'`. Each
+ * value follows the same shape as a single `server.files.metadata`
+ * response, but the bulk lookup is much cheaper for populating a file
+ * browser (one round-trip instead of one per file).
+ *
+ * @example
+ * ```ts
+ * const all = await client.getDatabaseItem<GcodeMetadataMap>(
+ *   'gcode_metadata',
+ * );
+ * const meta = all['print1.gcode'];
+ * console.log(meta?.estimated_time);
+ * ```
+ * @source
+ */
+export type GcodeMetadataMap = Readonly<Record<string, GcodeFileMetadata>>;

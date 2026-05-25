@@ -16,6 +16,8 @@ import { SocketState, type SocketStateValue } from './socket-states';
 import {
   type ClientConfig,
   type ConnectionConfig,
+  type FileEntry,
+  type GcodeFileMetadata,
   type JsonRpcRequest,
   type PrinterObjectSpec,
   type SubscribeResult,
@@ -171,6 +173,24 @@ export class MoonrakerClient extends EventEmitter {
    */
   readonly config: ConnectionConfig;
 
+  /**
+   * Base URL for the Moonraker HTTP API — `{http|https}://host[:port]`
+   * with no trailing slash. Built once in the constructor from
+   * {@link ConnectionConfig}. Use this when constructing URLs for any
+   * Moonraker HTTP endpoint (logs, files, thumbnails) so the scheme +
+   * port follow whatever the client was configured with rather than
+   * being re-derived (and possibly drifted) at each call site.
+   *
+   * @example
+   * ```ts
+   * const url = `${client.httpBaseUrl}/server/files/gcodes/${path}`;
+   * const res = await fetch(url);
+   * ```
+   *
+   * @source
+   */
+  readonly httpBaseUrl: string;
+
   private readonly wsOptions: ClientOptions;
   private readonly wsURL: string;
   private readonly heartbeatTimeoutMs: number;
@@ -211,6 +231,7 @@ export class MoonrakerClient extends EventEmitter {
     this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_MS;
     this.wsOptions = { handshakeTimeout: DEFAULT_HANDSHAKE_TIMEOUT_MS };
     this.wsURL = MoonrakerClient.buildUrl(connection);
+    this.httpBaseUrl = MoonrakerClient.buildHttpBase(connection);
     this.ws = this.openSocket();
   }
 
@@ -488,6 +509,189 @@ export class MoonrakerClient extends EventEmitter {
   }
 
   /**
+   * Fetch the catalog of extended G-code commands Klipper currently exposes.
+   *
+   * Klipper builds this dictionary by scanning loaded modules at startup, so
+   * the available commands vary by printer config (e.g. `BED_MESH_CALIBRATE`
+   * only appears if `[bed_mesh]` is configured). Useful for driving an
+   * autocomplete UI, validating a script before sending it, or rendering a
+   * `HELP` table without re-implementing it.
+   *
+   * @returns A promise resolving to a dictionary keyed by command name
+   *   (uppercase, no leading slash) with the one-line description as value.
+   * @throws {@link MoonrakerError} if the request fails.
+   *
+   * @example
+   * Populate an autocomplete dropdown:
+   * ```ts
+   * const help = await client.getGcodeHelp();
+   * const names = Object.keys(help).sort();
+   * // names → ['BED_MESH_CALIBRATE', 'FIRMWARE_RESTART', 'HELP', 'RESTART', …]
+   * console.log(help.RESTART);
+   * // → 'Reload config file and restart host software'
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#list-available-gcode-commands | List Available GCode Commands}
+   * @source
+   */
+  getGcodeHelp(): Promise<Readonly<Record<string, string>>> {
+    return this.request<Readonly<Record<string, string>>>('printer.gcode.help');
+  }
+
+  /**
+   * Fetch metadata for a single gcode file Moonraker has cataloged — the
+   * same payload Fluidd / Mainsail use to populate their file lists and
+   * print-status thumbnails. Includes slicer info, layer/time estimates,
+   * filament weights, and the `thumbnails` array (small/medium/large PNGs
+   * extracted from the file at upload time).
+   *
+   * To render a thumbnail: pick an entry from `thumbnails`, then fetch
+   * the PNG over HTTP from
+   * `http://<host>:<port>/server/files/gcodes/<thumbnail.relative_path>`.
+   *
+   * @param filename - Relative path / filename as Moonraker knows it,
+   *   without a leading `gcodes/` (e.g. `"print.gcode"` or
+   *   `"subdir/print.gcode"`).
+   * @returns The metadata object — see {@link GcodeFileMetadata}.
+   * @throws {@link MoonrakerError} if the request fails or the file is
+   *   not in Moonraker's catalog.
+   *
+   * @example
+   * ```ts
+   * const status = await client.request<{ print_stats: { filename: string } }>(
+   *   'printer.objects.query',
+   *   { objects: { print_stats: ['filename'] } },
+   * );
+   * const meta = await client.getFileMetadata(status.print_stats.filename);
+   * const thumb = meta.thumbnails.find((t) => t.width >= 100) ?? meta.thumbnails[0];
+   * if (thumb) {
+   *   const url = `http://${host}:${port}/server/files/gcodes/${thumb.relative_path}`;
+   * }
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#get-gcode-metadata | Get GCode Metadata}
+   * @source
+   */
+  getFileMetadata(filename: string): Promise<GcodeFileMetadata> {
+    return this.request<GcodeFileMetadata>('server.files.metadata', { filename });
+  }
+
+  /**
+   * List files Moonraker has cataloged under a given root, optionally
+   * recursing into subdirectories. The most common root is `'gcodes'`
+   * (the print-files root); other roots include `'config'`, `'logs'`,
+   * and `'timelapse'`.
+   *
+   * Each entry is a {@link FileEntry} with `path`, `modified`, `size`,
+   * and `permissions`. Subdirectories aren't returned as entries —
+   * they're implied by the `path` strings (e.g. `'subdir/print.gcode'`).
+   *
+   * @param root - File root to list. Defaults to `'gcodes'`.
+   * @returns Array of files.
+   * @throws {@link MoonrakerError} on transport / server errors.
+   *
+   * @example
+   * ```ts
+   * const files = await client.listFiles();
+   * for (const f of files) console.log(f.path, f.size);
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#list-available-files | List Available Files}
+   * @source
+   */
+  listFiles(root: string = 'gcodes'): Promise<readonly FileEntry[]> {
+    return this.request<readonly FileEntry[]>('server.files.list', { root });
+  }
+
+  /**
+   * Look up a key (or the entire namespace) in Moonraker's persistent
+   * database. The `gcode_metadata` namespace holds a `{ filename →
+   * GcodeFileMetadata }` map that's much cheaper to populate a file
+   * browser from than calling `server.files.metadata` per file.
+   *
+   * @param namespace - Namespace name. e.g. `'gcode_metadata'`.
+   * @param key - Optional key to read. Omit to read the whole namespace.
+   * @returns Whatever JSON value is stored at that key (or the namespace
+   *   root if `key` is omitted). Cast with a type parameter on the call.
+   * @throws {@link MoonrakerError} if the namespace or key doesn't exist.
+   *
+   * @example
+   * Read the full gcode metadata cache:
+   * ```ts
+   * import type { GcodeMetadataMap } from '@jhyland87/moonraker-client';
+   * const all = await client.getDatabaseItem<GcodeMetadataMap>(
+   *   'gcode_metadata',
+   * );
+   * console.log(Object.keys(all).length, 'files cached');
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#get-database-item | Get Database Item}
+   * @source
+   */
+  getDatabaseItem<T = unknown>(namespace: string, key?: string): Promise<T> {
+    const params: Record<string, string> = { namespace };
+    if (key !== undefined) params.key = key;
+    // Moonraker wraps the actual value in `{ namespace, key, value }`.
+    // Unwrap so callers get just what they asked for.
+    return this.request<{ namespace: string; key?: string; value: T }>(
+      'server.database.item',
+      params,
+    ).then((response) => response.value);
+  }
+
+  /**
+   * Delete a file from a Moonraker root. The path is relative to the
+   * root and is given in the standard `root/path` form (e.g.
+   * `'gcodes/print.gcode'`).
+   *
+   * Safe to call mid-print only for files that aren't currently being
+   * printed — Moonraker will refuse the deletion otherwise. This method
+   * doesn't preflight that check.
+   *
+   * @param rootAndPath - Full file identifier, e.g.
+   *   `'gcodes/subdir/print.gcode'`.
+   * @returns The deleted file's metadata (echoes the input).
+   * @throws {@link MoonrakerError} if the file is missing, currently
+   *   printing, or otherwise undeletable.
+   *
+   * @example
+   * ```ts
+   * await client.deleteFile('gcodes/old-print.gcode');
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#delete-file | Delete File}
+   * @source
+   */
+  deleteFile(rootAndPath: string): Promise<unknown> {
+    return this.request('server.files.delete_file', { path: rootAndPath });
+  }
+
+  /**
+   * Start a print of the named gcode file.
+   *
+   * **Has a side effect on the printer** — issues `printer.print.start`,
+   * which actually begins motion. Callers should confirm intent before
+   * calling. Will fail if a print is already active.
+   *
+   * @param filename - Gcode filename as Moonraker knows it (no leading
+   *   `'gcodes/'`; e.g. `'subdir/print.gcode'`).
+   * @returns Moonraker's `'ok'` acknowledgment string.
+   * @throws {@link MoonrakerError} if the file is missing or the printer
+   *   isn't ready.
+   *
+   * @example
+   * ```ts
+   * await client.startPrint('print.gcode');
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#start-print | Start Print}
+   * @source
+   */
+  startPrint(filename: string): Promise<string> {
+    return this.request<string>('printer.print.start', { filename });
+  }
+
+  /**
    * Fetch the trailing bytes of a Moonraker-served log file over HTTP.
    *
    * Uses an HTTP `Range: bytes=-N` request against `/server/files/<name>` on
@@ -508,8 +712,7 @@ export class MoonrakerClient extends EventEmitter {
    * @source
    */
   async getLogTail(name: string = 'klippy.log', bytes: number = 50_000): Promise<string> {
-    const port = this.config.port ?? 80;
-    const url = `http://${this.config.server}:${port}/server/files/${name}`;
+    const url = `${this.httpBaseUrl}/server/files/${name}`;
     const res = await fetch(url, { headers: { Range: `bytes=-${bytes}` } });
     if (!res.ok && res.status !== 206) {
       throw new MoonrakerError(`getLogTail ${name}: HTTP ${res.status}`, res.status);
@@ -707,9 +910,13 @@ export class MoonrakerClient extends EventEmitter {
   }
 
   /**
-   * Compose the full `ws://host:port/path` URL from a
+   * Compose the full websocket URL (`ws://` or `wss://`) from a
    * {@link ConnectionConfig}. Applied once in the constructor and
    * cached on the instance.
+   *
+   * Scheme tracks {@link ConnectionConfig.secure}; the port segment is
+   * elided when it matches the scheme's default (80 / 443) so URLs read
+   * naturally instead of carrying the redundant port.
    *
    * @param cfg - The validated connection config.
    * @returns The fully-qualified websocket URL string.
@@ -718,8 +925,31 @@ export class MoonrakerClient extends EventEmitter {
    */
   private static buildUrl(cfg: ConnectionConfig): string {
     if (!cfg.server) throw new Error('No websocket server specified in connection config');
-    const port = cfg.port ?? 80;
+    const scheme = cfg.secure ? 'wss' : 'ws';
+    const defaultPort = cfg.secure ? 443 : 80;
+    const port = cfg.port ?? defaultPort;
+    const portSegment = port === defaultPort ? '' : `:${port}`;
     const path = cfg.path ?? '/websocket';
-    return `ws://${cfg.server}:${port}${path}`;
+    return `${scheme}://${cfg.server}${portSegment}${path}`;
+  }
+
+  /**
+   * Compose the Moonraker HTTP base URL — `{http|https}://host[:port]`
+   * with no trailing slash. Mirrors {@link buildUrl}'s scheme/port logic
+   * but for the HTTP side of the API (file fetches, log tails, etc.).
+   *
+   * Exposed on the instance as {@link MoonrakerClient.httpBaseUrl} so
+   * consumers don't have to re-derive host/port/scheme.
+   *
+   * @param cfg - The validated connection config.
+   * @returns The HTTP base URL without trailing slash.
+   * @source
+   */
+  private static buildHttpBase(cfg: ConnectionConfig): string {
+    const scheme = cfg.secure ? 'https' : 'http';
+    const defaultPort = cfg.secure ? 443 : 80;
+    const port = cfg.port ?? defaultPort;
+    const portSegment = port === defaultPort ? '' : `:${port}`;
+    return `${scheme}://${cfg.server}${portSegment}`;
   }
 }
