@@ -24,7 +24,7 @@
  * ```
  */
 
-export { MoonrakerClient } from './client';
+export { MoonrakerClient, parseFanSettings } from './client';
 export { MoonrakerError } from './errors';
 export {
   isGcodeResponseParams,
@@ -41,6 +41,9 @@ export type { MoonrakerEvents } from './events';
 export type {
   ClientConfig,
   ConnectionConfig,
+  FanDescriptor,
+  FanDiscovery,
+  FanSectionType,
   FileEntry,
   GcodeFileMetadata,
   GcodeMetadataMap,

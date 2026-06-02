@@ -213,6 +213,52 @@ export interface SubscribeResult {
 }
 
 /**
+ * Section types in `configfile.settings` that always denote a fan and are
+ * subscribable as live status objects. `output_pin` is handled separately
+ * (it's only a fan when its pin name looks fan-related).
+ * @source
+ */
+export type FanSectionType =
+  | 'fan'
+  | 'heater_fan'
+  | 'controller_fan'
+  | 'temperature_fan'
+  | 'fan_generic';
+
+/**
+ * A fan discovered from `configfile.settings`. `objectName` is the literal
+ * Moonraker status key (e.g. `'temperature_fan chamber_fan'`,
+ * `'output_pin fan0'`) used verbatim in subscription/query specs.
+ * @source
+ */
+export interface FanDescriptor {
+  /** Literal Moonraker object key. */
+  readonly objectName: string;
+  /** Section type the key matched. `'output_pin'` for PWM-fan pins. */
+  readonly sectionType: FanSectionType | 'output_pin';
+  /** Short label — the name after the section type, or the whole key. */
+  readonly label: string;
+  /**
+   * Runtime field carrying this fan's primary 0..1 output: `'value'` for
+   * `output_pin`, `'speed'` for every Klipper fan section.
+   */
+  readonly speedField: 'value' | 'speed';
+  /** True when the fan also reports `temperature`/`target` (temperature_fan). */
+  readonly hasTemperature: boolean;
+}
+
+/**
+ * Result of fan discovery: the monitorable fans plus whether the special
+ * Creality `fan_feedback` tachometer object is present.
+ * @source
+ */
+export interface FanDiscovery {
+  readonly fans: readonly FanDescriptor[];
+  /** True when `configfile.settings` contains a `fan_feedback` section. */
+  readonly hasFanFeedback: boolean;
+}
+
+/**
  * `params` shape of a `notify_status_update` notification: a 2-element
  * tuple of `[status, eventtime]`. Modeled here as an interface
  * extending `Array<unknown>` to keep tuple semantics while preserving

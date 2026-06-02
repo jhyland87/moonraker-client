@@ -16,6 +16,9 @@ import { SocketState, type SocketStateValue } from './socket-states';
 import {
   type ClientConfig,
   type ConnectionConfig,
+  type FanDescriptor,
+  type FanDiscovery,
+  type FanSectionType,
   type FileEntry,
   type GcodeFileMetadata,
   type JsonRpcRequest,
@@ -80,6 +83,78 @@ const normalizeObjectSpec = (
     return Object.fromEntries(spec.map((name) => [name, null]));
   }
   return spec;
+};
+
+/**
+ * Config section types that always denote a subscribable fan status object.
+ */
+const ALWAYS_FAN_SECTIONS: ReadonlySet<string> = new Set<FanSectionType>([
+  'fan',
+  'heater_fan',
+  'controller_fan',
+  'temperature_fan',
+  'fan_generic',
+]);
+
+/**
+ * Parse `configfile.settings` keys into the set of subscribable fan objects.
+ *
+ * Each settings key is `section` or `section name` (split on the first
+ * space). Rules:
+ *
+ * - `gcode_macro …` is excluded outright (macros, not hardware).
+ * - `fan_feedback` is detected separately and reported via `hasFanFeedback`.
+ * - Sections in {@link ALWAYS_FAN_SECTIONS} are fans (`speedField: 'speed'`;
+ *   `hasTemperature` only for `temperature_fan`).
+ * - `output_pin <name>` is a fan only when `<name>` (lowercased) contains
+ *   `'fan'` — so `output_pin fan0` qualifies but `output_pin led` doesn't.
+ * - Everything else (`multi_pin`, `static_digital_output`, …) is skipped by
+ *   not being in the allow-list.
+ *
+ * @param settings - The `status.configfile.settings` record.
+ * @returns Discovered fans (sorted by `objectName`) + fan_feedback presence.
+ * @source
+ */
+export const parseFanSettings = (
+  settings: Readonly<Record<string, unknown>>,
+): FanDiscovery => {
+  const fans: FanDescriptor[] = [];
+  let hasFanFeedback = false;
+
+  for (const key of Object.keys(settings)) {
+    if (key === 'fan_feedback') {
+      hasFanFeedback = true;
+      continue;
+    }
+    const spaceIndex = key.indexOf(' ');
+    const section = spaceIndex < 0 ? key : key.slice(0, spaceIndex);
+    const name = spaceIndex < 0 ? '' : key.slice(spaceIndex + 1);
+    if (section === 'gcode_macro') {
+      continue;
+    }
+    if (ALWAYS_FAN_SECTIONS.has(section)) {
+      fans.push({
+        objectName: key,
+        sectionType: section as FanSectionType,
+        label: name || section,
+        speedField: 'speed',
+        hasTemperature: section === 'temperature_fan',
+      });
+      continue;
+    }
+    if (section === 'output_pin' && name.toLowerCase().includes('fan')) {
+      fans.push({
+        objectName: key,
+        sectionType: 'output_pin',
+        label: name,
+        speedField: 'value',
+        hasTemperature: false,
+      });
+    }
+  }
+
+  fans.sort((a, b) => a.objectName.localeCompare(b.objectName));
+  return { fans, hasFanFeedback };
 };
 
 /**
@@ -164,13 +239,6 @@ export interface MoonrakerClient {
  * @source
  */
 export class MoonrakerClient extends EventEmitter {
-  /**
-   * The connection settings the client was constructed with. Surfaced as
-   * a public `readonly` field rather than a pass-through getter (which
-   * Google's style guide flags as an anti-pattern for accessor-only
-   * properties).
-   * @source
-   */
   readonly config: ConnectionConfig;
 
   /**
@@ -432,6 +500,33 @@ export class MoonrakerClient extends EventEmitter {
    */
   getObjectsList(): Promise<{ objects: string[] }> {
     return this.request('printer.objects.list');
+  }
+
+  /**
+   * Discover the printer's fans by reading `configfile.settings` once and
+   * scanning for fan-bearing section types. Does *not* subscribe — it's a
+   * one-shot {@link queryObjects} read, safe to call anytime. The returned
+   * `objectName`s can be fed into a subscription/query spec to monitor live
+   * fan speeds. See {@link parseFanSettings} for the matching rules.
+   *
+   * @returns A promise resolving to the discovered fans + whether the
+   *   Creality `fan_feedback` tachometer object exists.
+   * @throws {@link MoonrakerError} if the query fails.
+   *
+   * @example
+   * ```ts
+   * const { fans } = await client.discoverFans();
+   * await client.subscribe(Object.fromEntries(fans.map((f) => [f.objectName, null])));
+   * ```
+   * @source
+   */
+  async discoverFans(): Promise<FanDiscovery> {
+    const { status } = await this.queryObjects({ configfile: ['settings'] });
+    // `configfile` and its `settings` field are opaque records on
+    // PrinterStatus; narrow at this boundary like `request<T>` does.
+    const settings =
+      (status.configfile?.['settings'] as Record<string, unknown> | undefined) ?? {};
+    return parseFanSettings(settings);
   }
 
   /**

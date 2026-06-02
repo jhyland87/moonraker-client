@@ -23,11 +23,14 @@ describe('public exports', () => {
       'MoonrakerError',
       'SocketState',
       'describeSocketState',
+      'isGcodeResponseParams',
       'isJsonRpcErrorResponse',
       'isJsonRpcMessage',
       'isJsonRpcNotification',
       'isJsonRpcResponse',
+      'isProcStatUpdateParams',
       'isStatusUpdateParams',
+      'parseFanSettings',
     ]);
   });
 });
