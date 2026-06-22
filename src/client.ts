@@ -1,5 +1,4 @@
 import { EventEmitter } from 'node:events';
-import WebSocket, { type ClientOptions } from 'ws';
 
 import { MoonrakerError } from './errors';
 import type { MoonrakerEvents } from './events';
@@ -10,8 +9,15 @@ import {
   isJsonRpcNotification,
   isJsonRpcResponse,
   isProcStatUpdateParams,
+  isRecord,
   isStatusUpdateParams,
 } from './guards';
+import {
+  defaultSocketFactory,
+  type SocketData,
+  type SocketFactory,
+  type SocketLike,
+} from './sockets';
 import { SocketState, type SocketStateValue } from './socket-states';
 import {
   type ClientConfig,
@@ -21,17 +27,23 @@ import {
   type FanSectionType,
   type FileEntry,
   type GcodeFileMetadata,
+  type GcodeStoreEntry,
+  type HistoryListOptions,
+  type HistoryListResult,
+  type HistoryTotalsResult,
+  type JobQueueStatus,
   type JsonRpcRequest,
+  type MachineSystemInfo,
   type PrinterObjectSpec,
+  type ProcStats,
   type SubscribeResult,
   type TemperatureStore,
+  type VelocityLimits,
+  type WebcamList,
 } from './types';
 
 /** Default heartbeat timeout (ms) — see {@link MoonrakerClient.resetHeartbeat}. */
 const DEFAULT_HEARTBEAT_MS = 31_000;
-
-/** Default handshake timeout passed to the underlying `ws` `WebSocket`. */
-const DEFAULT_HANDSHAKE_TIMEOUT_MS = 1_000;
 
 /**
  * Like `Array.isArray` but narrows to `readonly string[]` instead of
@@ -88,13 +100,17 @@ const normalizeObjectSpec = (
 /**
  * Config section types that always denote a subscribable fan status object.
  */
-const ALWAYS_FAN_SECTIONS: ReadonlySet<string> = new Set<FanSectionType>([
+const FAN_SECTION_TYPES = [
   'fan',
   'heater_fan',
   'controller_fan',
   'temperature_fan',
   'fan_generic',
-]);
+] as const satisfies readonly FanSectionType[];
+
+/** Type guard: is `section` one of the always-fan {@link FanSectionType}s? */
+const isFanSectionType = (section: string): section is FanSectionType =>
+  FAN_SECTION_TYPES.some((known) => known === section);
 
 /**
  * Parse `configfile.settings` keys into the set of subscribable fan objects.
@@ -132,10 +148,10 @@ export const parseFanSettings = (
     if (section === 'gcode_macro') {
       continue;
     }
-    if (ALWAYS_FAN_SECTIONS.has(section)) {
+    if (isFanSectionType(section)) {
       fans.push({
         objectName: key,
-        sectionType: section as FanSectionType,
+        sectionType: section,
         label: name || section,
         speedField: 'speed',
         hasTemperature: section === 'temperature_fan',
@@ -259,13 +275,14 @@ export class MoonrakerClient extends EventEmitter {
    */
   readonly httpBaseUrl: string;
 
-  private readonly wsOptions: ClientOptions;
+  private readonly socketFactory: SocketFactory;
   private readonly wsURL: string;
   private readonly heartbeatTimeoutMs: number;
 
-  private ws: WebSocket;
-  private pingTimeout: NodeJS.Timeout | null = null;
+  private ws: SocketLike | undefined;
+  private pingTimeout: ReturnType<typeof setTimeout> | null = null;
   private requestCounter = 0;
+  private oneshotTokenObtained = false;
 
   /**
    * Construct the client and open the websocket. The connection is asynchronous;
@@ -276,6 +293,10 @@ export class MoonrakerClient extends EventEmitter {
    * @param options - Optional client tuning.
    * @param options.heartbeatTimeoutMs - How long to wait between pings before
    *   force-terminating the socket. Defaults to `31000`.
+   * @param options.socketFactory - Constructs the underlying socket. Defaults
+   *   to {@link defaultSocketFactory}, which wraps the platform-global
+   *   `WebSocket` (browser / extension service worker / Node 22+). Inject a
+   *   custom factory for tests or runtimes without a global `WebSocket`.
    * @throws Error if `config.API.connection` is missing or `server` is empty.
    *
    * @example
@@ -288,7 +309,10 @@ export class MoonrakerClient extends EventEmitter {
    * ```
    * @source
    */
-  constructor(config: ClientConfig, options: { heartbeatTimeoutMs?: number } = {}) {
+  constructor(
+    config: ClientConfig,
+    options: { heartbeatTimeoutMs?: number; socketFactory?: SocketFactory } = {},
+  ) {
     super();
     const connection = config?.API?.connection;
     if (!connection) {
@@ -297,10 +321,17 @@ export class MoonrakerClient extends EventEmitter {
 
     this.config = connection;
     this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_MS;
-    this.wsOptions = { handshakeTimeout: DEFAULT_HANDSHAKE_TIMEOUT_MS };
+    this.socketFactory = options.socketFactory ?? defaultSocketFactory;
     this.wsURL = MoonrakerClient.buildUrl(connection);
     this.httpBaseUrl = MoonrakerClient.buildHttpBase(connection);
-    this.ws = this.openSocket();
+    if (connection.oneshotToken === false) {
+      // Synchronous, tokenless connect (trusted setups / tests).
+      this.ws = this.openSocket(this.wsURL);
+    } else {
+      // Fetch a one-shot token first, then open (Moonraker [authorization]).
+      this.ws = undefined;
+      void this.openWithOneshotToken();
+    }
   }
 
   /**
@@ -316,7 +347,9 @@ export class MoonrakerClient extends EventEmitter {
    * @source
    */
   get readyState(): SocketStateValue {
-    return this.ws.readyState;
+    // Before the one-shot token resolves, no socket exists yet — report
+    // CONNECTING so callers treat the client as not-yet-open.
+    return this.ws?.readyState ?? SocketState.CONNECTING;
   }
 
   /**
@@ -333,6 +366,19 @@ export class MoonrakerClient extends EventEmitter {
    */
   get isOpen(): boolean {
     return this.readyState === SocketState.OPEN;
+  }
+
+  /**
+   * Whether a one-shot token was successfully fetched for this connection. When
+   * this is `true` but the socket never opens (closes/errors first), the most
+   * likely cause is a server-side websocket rejection *after* authentication —
+   * e.g. Moonraker's Tornado `check_origin` returning HTTP 403 for a
+   * disallowed `Origin`. Consumers can use this to surface a targeted hint.
+   *
+   * @source
+   */
+  get tokenObtained(): boolean {
+    return this.oneshotTokenObtained;
   }
 
   // --- Public API -----------------------------------------------------------
@@ -382,7 +428,14 @@ export class MoonrakerClient extends EventEmitter {
       resolve(msg.result as T);
     });
 
-    this.send(payload).catch(reject);
+    // Fire-and-forget the write; bridge any transport error to the resolver.
+    void (async () => {
+      try {
+        await this.send(payload);
+      } catch (err) {
+        reject(err);
+      }
+    })();
 
     return promise;
   }
@@ -522,11 +575,10 @@ export class MoonrakerClient extends EventEmitter {
    */
   async discoverFans(): Promise<FanDiscovery> {
     const { status } = await this.queryObjects({ configfile: ['settings'] });
-    // `configfile` and its `settings` field are opaque records on
-    // PrinterStatus; narrow at this boundary like `request<T>` does.
-    const settings =
-      (status.configfile?.['settings'] as Record<string, unknown> | undefined) ?? {};
-    return parseFanSettings(settings);
+    // `configfile.settings` is an opaque record on PrinterStatus; narrow it
+    // with a runtime guard at this boundary.
+    const rawSettings = status.configfile?.['settings'];
+    return parseFanSettings(isRecord(rawSettings) ? rawSettings : {});
   }
 
   /**
@@ -723,42 +775,140 @@ export class MoonrakerClient extends EventEmitter {
    * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#get-database-item | Get Database Item}
    * @source
    */
-  getDatabaseItem<T = unknown>(namespace: string, key?: string): Promise<T> {
+  async getDatabaseItem<T = unknown>(namespace: string, key?: string): Promise<T> {
     const params: Record<string, string> = { namespace };
     if (key !== undefined) params.key = key;
     // Moonraker wraps the actual value in `{ namespace, key, value }`.
     // Unwrap so callers get just what they asked for.
-    return this.request<{ namespace: string; key?: string; value: T }>(
-      'server.database.item',
+    const response = await this.request<{ namespace: string; key?: string; value: T }>(
+      'server.database.get_item',
       params,
-    ).then((response) => response.value);
+    );
+    return response.value;
   }
 
   /**
-   * Delete a file from a Moonraker root. The path is relative to the
-   * root and is given in the standard `root/path` form (e.g.
-   * `'gcodes/print.gcode'`).
+   * Write a value into Moonraker's persistent database, creating the
+   * namespace if necessary. Front-end clients (Mainsail, Fluidd, and now
+   * Helmsman) use this to store per-printer UI state — dashboard layout,
+   * console history, chart selections — so it follows the printer rather
+   * than the browser.
    *
-   * Safe to call mid-print only for files that aren't currently being
-   * printed — Moonraker will refuse the deletion otherwise. This method
-   * doesn't preflight that check.
-   *
-   * @param rootAndPath - Full file identifier, e.g.
-   *   `'gcodes/subdir/print.gcode'`.
-   * @returns The deleted file's metadata (echoes the input).
-   * @throws {@link MoonrakerError} if the file is missing, currently
-   *   printing, or otherwise undeletable.
+   * @typeParam T - The value's type, echoed back in the result.
+   * @param namespace - Namespace to write under (e.g. `'helmsman'`).
+   * @param key - Key path. Dotted (`'dashboard.layout'`) for nested writes,
+   *   or omit to replace the whole namespace value.
+   * @param value - JSON-serializable value to store.
+   * @returns The stored `{ namespace, key, value }` echo.
+   * @throws {@link MoonrakerError} on failure.
    *
    * @example
    * ```ts
-   * await client.deleteFile('gcodes/old-print.gcode');
+   * await client.postDatabaseItem('helmsman', 'dashboard', layout);
    * ```
    *
-   * @see {@link https://moonraker.readthedocs.io/en/latest/web_api/#delete-file | Delete File}
+   * @see {@link https://moonraker.readthedocs.io/en/latest/external_api/database/ | Database API}
    * @source
    */
-  deleteFile(rootAndPath: string): Promise<unknown> {
+  postDatabaseItem<T = unknown>(
+    namespace: string,
+    key: string | undefined,
+    value: T,
+  ): Promise<{ namespace: string; key?: string; value: T }> {
+    const params: Record<string, unknown> = { namespace, value };
+    if (key !== undefined) params.key = key;
+    return this.request('server.database.post_item', params);
+  }
+
+  /**
+   * Delete a key (or an entire namespace, when `key` is omitted) from
+   * Moonraker's persistent database.
+   *
+   * @param namespace - Namespace to delete from.
+   * @param key - Key path to remove. Omit to drop the whole namespace.
+   * @returns The deleted `{ namespace, key, value }` echo.
+   * @throws {@link MoonrakerError} if the namespace or key doesn't exist.
+   *
+   * @example
+   * ```ts
+   * await client.deleteDatabaseItem('helmsman', 'dashboard');
+   * ```
+   * @source
+   */
+  deleteDatabaseItem<T = unknown>(
+    namespace: string,
+    key?: string,
+  ): Promise<{ namespace: string; key?: string; value: T }> {
+    const params: Record<string, string> = { namespace };
+    if (key !== undefined) params.key = key;
+    return this.request('server.database.delete_item', params);
+  }
+
+  /**
+   * List the namespaces (and backups) currently present in Moonraker's
+   * database. Useful for detecting whether Helmsman has previously stored
+   * settings on this printer.
+   *
+   * @returns `{ namespaces, backups }` — both arrays of names.
+   * @throws {@link MoonrakerError} on failure.
+   * @source
+   */
+  listDatabaseNamespaces(): Promise<{ namespaces: string[]; backups: string[] }> {
+    return this.request('server.database.list');
+  }
+
+  /**
+   * Delete a file or directory from a Moonraker root, given in the standard
+   * `root/path` form (e.g. `'gcodes/print.gcode'` or `'gcodes/old-folder'`).
+   *
+   * Modeled on `fs.rm`: by default this removes a single file; pass
+   * `{ recursive: true }` to remove a directory and everything inside it.
+   * Internally this routes to `server.files.delete_file` or
+   * `server.files.delete_directory` accordingly — callers don't deal with two
+   * endpoints.
+   *
+   * Safe to call mid-print only for paths not currently being printed —
+   * Moonraker refuses otherwise; this method doesn't preflight that check.
+   *
+   * @param rootAndPath - Full identifier, e.g. `'gcodes/subdir/print.gcode'`.
+   * @param options.recursive - Remove a directory and its contents. Defaults to
+   *   false (file removal).
+   * @returns Moonraker's delete result.
+   * @throws {@link MoonrakerError} if the path is missing, currently printing,
+   *   or otherwise undeletable.
+   *
+   * @example
+   * ```ts
+   * await client.delete('gcodes/old-print.gcode');
+   * await client.delete('gcodes/old-folder', { recursive: true });
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/external_api/file_manager/ | File Manager API}
+   * @source
+   */
+  delete(rootAndPath: string, options?: { recursive?: boolean }): Promise<unknown> {
+    if (options?.recursive) {
+      return this.request('server.files.delete_directory', { path: rootAndPath, force: true });
+    }
     return this.request('server.files.delete_file', { path: rootAndPath });
+  }
+
+  /**
+   * Move or rename a file or directory within Moonraker's file roots
+   * (`server.files.move`). Both paths are in the standard `root/path` form
+   * (e.g. `'gcodes/old.gcode'` → `'gcodes/sub/new.gcode'`). Renaming is a move
+   * whose destination keeps the same directory with a new name.
+   *
+   * @param source - Existing `root/path`.
+   * @param dest - Destination `root/path`.
+   * @returns Moonraker's move result.
+   * @throws {@link MoonrakerError} if the source is missing or the move fails.
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/external_api/file_manager/ | File Manager API}
+   * @source
+   */
+  move(source: string, dest: string): Promise<unknown> {
+    return this.request('server.files.move', { source, dest });
   }
 
   /**
@@ -784,6 +934,322 @@ export class MoonrakerClient extends EventEmitter {
    */
   startPrint(filename: string): Promise<string> {
     return this.request<string>('printer.print.start', { filename });
+  }
+
+  // --- High-level commands --------------------------------------------------
+
+  /**
+   * Run a raw G-code script line (or multiple newline-separated lines).
+   *
+   * **Has a side effect on the printer.** This is the foundation most other
+   * command helpers build on.
+   *
+   * @param script - The G-code to execute (e.g. `'G28'`, `'M104 S200'`).
+   * @returns Moonraker's `'ok'` acknowledgment.
+   * @throws {@link MoonrakerError} if Klippy rejects the command.
+   * @see {@link https://moonraker.readthedocs.io/en/latest/external_api/printer/ | Run a GCode}
+   * @source
+   */
+  runGcode(script: string): Promise<string> {
+    return this.request<string>('printer.gcode.script', { script });
+  }
+
+  /**
+   * Trigger an immediate emergency stop (`M112`). Halts all motion and
+   * shuts down Klipper; recovery requires a firmware restart.
+   *
+   * @returns `'ok'`.
+   * @throws {@link MoonrakerError} on failure.
+   * @source
+   */
+  emergencyStop(): Promise<string> {
+    return this.request<string>('printer.emergency_stop');
+  }
+
+  /**
+   * Pause the active print (`printer.print.pause`).
+   * @returns `'ok'`.
+   * @source
+   */
+  pausePrint(): Promise<string> {
+    return this.request<string>('printer.print.pause');
+  }
+
+  /**
+   * Resume a paused print (`printer.print.resume`).
+   * @returns `'ok'`.
+   * @source
+   */
+  resumePrint(): Promise<string> {
+    return this.request<string>('printer.print.resume');
+  }
+
+  /**
+   * Cancel the active print (`printer.print.cancel`).
+   * @returns `'ok'`.
+   * @source
+   */
+  cancelPrint(): Promise<string> {
+    return this.request<string>('printer.print.cancel');
+  }
+
+  /**
+   * Restart the Klipper firmware/MCU connection (`printer.firmware_restart`).
+   * @returns `'ok'`.
+   * @source
+   */
+  restartFirmware(): Promise<string> {
+    return this.request<string>('printer.firmware_restart');
+  }
+
+  /**
+   * Restart the Klippy host process (`printer.restart`).
+   * @returns `'ok'`.
+   * @source
+   */
+  restartKlippy(): Promise<string> {
+    return this.request<string>('printer.restart');
+  }
+
+  /**
+   * Restart the Moonraker server process (`server.restart`).
+   * @returns `'ok'`.
+   * @source
+   */
+  restartServer(): Promise<string> {
+    return this.request<string>('server.restart');
+  }
+
+  /**
+   * Set a heater's target temperature via `SET_HEATER_TEMPERATURE`, which
+   * works uniformly for `extruder`, `heater_bed`, and any `heater_generic`.
+   *
+   * @param heater - Heater object name (e.g. `'extruder'`, `'heater_bed'`).
+   * @param target - Target temperature in °C (`0` turns the heater off).
+   * @returns `'ok'`.
+   * @source
+   */
+  setHeaterTemperature(heater: string, target: number): Promise<string> {
+    return this.runGcode(`SET_HEATER_TEMPERATURE HEATER=${heater} TARGET=${target}`);
+  }
+
+  /**
+   * Set a fan's speed. Picks the correct G-code for the fan type:
+   * - the part-cooling `fan` → `M106 S<0-255>`,
+   * - `output_pin <name>` → `SET_PIN PIN=<name> VALUE=<0-1>`,
+   * - any other (`fan_generic <name>`) → `SET_FAN_SPEED FAN=<name> SPEED=<0-1>`.
+   *
+   * @param objectName - The Moonraker fan object key (e.g. `'fan'`,
+   *   `'fan_generic exhaust'`, `'output_pin fan0'`).
+   * @param value - Speed in the range `0..1` (clamped).
+   * @returns `'ok'`.
+   * @source
+   */
+  setFanSpeed(objectName: string, value: number): Promise<string> {
+    const clamped = Math.max(0, Math.min(1, value));
+    if (objectName === 'fan') {
+      return this.runGcode(`M106 S${Math.round(clamped * 255)}`);
+    }
+    const spaceIndex = objectName.indexOf(' ');
+    const section = spaceIndex < 0 ? objectName : objectName.slice(0, spaceIndex);
+    const name = spaceIndex < 0 ? objectName : objectName.slice(spaceIndex + 1);
+    if (section === 'output_pin') {
+      return this.runGcode(`SET_PIN PIN=${name} VALUE=${clamped}`);
+    }
+    return this.runGcode(`SET_FAN_SPEED FAN=${name} SPEED=${clamped}`);
+  }
+
+  /**
+   * Home the printer. With no axes, homes all (`G28`); otherwise homes only
+   * the named axes (e.g. `home(['x', 'y'])` → `G28 X Y`).
+   *
+   * @param axes - Optional axes to home; case-insensitive.
+   * @returns `'ok'`.
+   * @source
+   */
+  home(axes?: readonly string[]): Promise<string> {
+    if (!axes || axes.length === 0) {
+      return this.runGcode('G28');
+    }
+    return this.runGcode(`G28 ${axes.map((a) => a.toUpperCase()).join(' ')}`);
+  }
+
+  /**
+   * Adjust the live Z gcode offset (Z babystepping) by a relative amount and
+   * apply it immediately (`SET_GCODE_OFFSET Z_ADJUST=<delta> MOVE=1`).
+   *
+   * @param deltaMm - Signed millimeters to add to the current Z offset.
+   * @returns `'ok'`.
+   * @source
+   */
+  adjustGcodeOffsetZ(deltaMm: number): Promise<string> {
+    return this.runGcode(`SET_GCODE_OFFSET Z_ADJUST=${deltaMm} MOVE=1`);
+  }
+
+  /**
+   * Update one or more kinematic limits via `SET_VELOCITY_LIMIT`. Only the
+   * provided fields are sent.
+   *
+   * @param limits - Any subset of velocity, acceleration, accel-to-decel, and
+   *   square-corner-velocity.
+   * @returns `'ok'`.
+   * @throws Error if no limit fields are provided.
+   * @source
+   */
+  setVelocityLimits(limits: VelocityLimits): Promise<string> {
+    const parts: string[] = [];
+    if (limits.velocity !== undefined) parts.push(`VELOCITY=${limits.velocity}`);
+    if (limits.accel !== undefined) parts.push(`ACCEL=${limits.accel}`);
+    if (limits.accelToDecel !== undefined) {
+      parts.push(`ACCEL_TO_DECEL=${limits.accelToDecel}`);
+    }
+    if (limits.squareCornerVelocity !== undefined) {
+      parts.push(`SQUARE_CORNER_VELOCITY=${limits.squareCornerVelocity}`);
+    }
+    if (parts.length === 0) {
+      throw new Error('setVelocityLimits: no limit fields provided');
+    }
+    return this.runGcode(`SET_VELOCITY_LIMIT ${parts.join(' ')}`);
+  }
+
+  /**
+   * Run a Klipper gcode macro by name, with optional uppercase `KEY=VALUE`
+   * parameters. Values containing spaces are quoted.
+   *
+   * @param name - Macro name (case-insensitive; sent uppercased).
+   * @param params - Optional parameters map.
+   * @returns `'ok'`.
+   * @source
+   */
+  runMacro(name: string, params?: Readonly<Record<string, string | number>>): Promise<string> {
+    const args = params
+      ? Object.entries(params).map(([key, raw]) => {
+          const value = String(raw);
+          const quoted = value.includes(' ') ? `"${value}"` : value;
+          return `${key.toUpperCase()}=${quoted}`;
+        })
+      : [];
+    return this.runGcode([name.toUpperCase(), ...args].join(' '));
+  }
+
+  // --- High-level queries ---------------------------------------------------
+
+  /**
+   * Fetch the recently-buffered gcode console output (echoes, responses,
+   * command history) so a console UI can backfill before live
+   * `notify:gcode_response` events arrive.
+   *
+   * @param count - Maximum entries to return. Omit for Moonraker's default.
+   * @returns The `gcode_store` entries, oldest first.
+   * @source
+   */
+  async getGcodeStore(count?: number): Promise<readonly GcodeStoreEntry[]> {
+    const params = count !== undefined ? { count } : undefined;
+    const result = await this.request<{ gcode_store: readonly GcodeStoreEntry[] }>(
+      'server.gcode_store',
+      params,
+    );
+    return result.gcode_store;
+  }
+
+  /**
+   * Fetch the current print job queue (`server.job_queue.status`).
+   * @returns The queued jobs and the queue's state.
+   * @source
+   */
+  getJobQueue(): Promise<JobQueueStatus> {
+    return this.request<JobQueueStatus>('server.job_queue.status');
+  }
+
+  /**
+   * Fetch print history (`server.history.list`).
+   *
+   * @param options - Paging/filter options (limit, start, since, before, order).
+   * @returns `{ count, jobs }`.
+   * @source
+   */
+  getHistory(options: HistoryListOptions = {}): Promise<HistoryListResult> {
+    const params: Record<string, unknown> = {};
+    if (options.limit !== undefined) params.limit = options.limit;
+    if (options.start !== undefined) params.start = options.start;
+    if (options.since !== undefined) params.since = options.since;
+    if (options.before !== undefined) params.before = options.before;
+    if (options.order !== undefined) params.order = options.order;
+    return this.request<HistoryListResult>(
+      'server.history.list',
+      Object.keys(params).length > 0 ? params : undefined,
+    );
+  }
+
+  /**
+   * Fetch aggregate print-history totals (`server.history.totals`).
+   * @returns `{ job_totals }`.
+   * @source
+   */
+  getHistoryTotals(): Promise<HistoryTotalsResult> {
+    return this.request<HistoryTotalsResult>('server.history.totals');
+  }
+
+  /**
+   * Fetch host machine info (`machine.system_info`): CPU, distribution,
+   * network, services. Returns the unwrapped `system_info` object.
+   * @source
+   */
+  async getMachineSystemInfo(): Promise<MachineSystemInfo> {
+    const result = await this.request<{ system_info: MachineSystemInfo }>(
+      'machine.system_info',
+    );
+    return result.system_info;
+  }
+
+  /**
+   * Fetch live process/resource stats (`machine.proc_stats`): Moonraker CPU
+   * and memory history, system CPU usage, memory, CPU temperature, uptime.
+   * @source
+   */
+  getProcStats(): Promise<ProcStats> {
+    return this.request<ProcStats>('machine.proc_stats');
+  }
+
+  /**
+   * List configured webcams (`server.webcams.list`) — stream/snapshot URLs and
+   * orientation flags for the webcam panel and popup background feature.
+   * @returns The webcam descriptors.
+   * @source
+   */
+  async getWebcams(): Promise<WebcamList> {
+    const result = await this.request<{ webcams: WebcamList }>('server.webcams.list');
+    return result.webcams;
+  }
+
+  /**
+   * Fetch a Moonraker one-shot websocket token over HTTP
+   * (`GET /access/oneshot_token`). The returned token is single-use and
+   * short-lived; append it to the websocket URL as `?token=<token>` to
+   * authenticate a connection from an untrusted client. Sends the configured
+   * {@link ConnectionConfig.apiKey} as `X-Api-Key` when present.
+   *
+   * @returns The token string, or `undefined` if the endpoint isn't available
+   *   (e.g. Moonraker has no `[authorization]` component → HTTP 404).
+   * @throws Error on a network failure (host unreachable).
+   *
+   * @example
+   * ```ts
+   * const token = await client.getOneshotToken();
+   * const url = token ? `${wsUrl}?token=${token}` : wsUrl;
+   * ```
+   *
+   * @see {@link https://moonraker.readthedocs.io/en/latest/external_api/authorization/ | Authorization API}
+   * @source
+   */
+  async getOneshotToken(): Promise<string | undefined> {
+    const headers: Record<string, string> = {};
+    if (this.config.apiKey) headers['X-Api-Key'] = this.config.apiKey;
+    const res = await fetch(`${this.httpBaseUrl}/access/oneshot_token`, { headers });
+    if (!res.ok) return undefined;
+    const body: unknown = await res.json();
+    const result = isRecord(body) ? body.result : undefined;
+    return typeof result === 'string' ? result : undefined;
   }
 
   /**
@@ -841,7 +1307,7 @@ export class MoonrakerClient extends EventEmitter {
       clearTimeout(this.pingTimeout);
       this.pingTimeout = null;
     }
-    this.ws.close(code, reason);
+    this.ws?.close(code, reason);
   }
 
   // --- Internal -------------------------------------------------------------
@@ -854,21 +1320,42 @@ export class MoonrakerClient extends EventEmitter {
    * the corresponding {@link close} or terminate cleans them up when
    * the underlying connection is closed and garbage-collected.
    *
-   * @returns The freshly-constructed `WebSocket` instance, already
-   *   wired with `open` / `message` / `error` / `close` / `ping`
-   *   handlers.
+   * @param url - The fully-composed websocket URL (possibly carrying a
+   *   `?token=` query appended by {@link openWithOneshotToken}).
+   * @returns The freshly-constructed socket, already wired with
+   *   `open` / `message` / `error` / `close` / `ping` handlers.
    * @source
    */
-  private openSocket(): WebSocket {
-    const ws = new WebSocket(this.wsURL, this.wsOptions);
+  private openSocket(url: string): SocketLike {
+    const ws = this.socketFactory(url);
     ws.on('open', () => this.handleOpen());
-    ws.on('message', (data: WebSocket.RawData) => this.handleMessage(data));
+    ws.on('message', (data) => this.handleMessage(data));
     ws.on('error', (err: Error) => this.emit('error', err));
-    ws.on('close', (code: number, reasonBuf: Buffer) =>
-      this.handleClose(code, reasonBuf.toString('utf-8')),
-    );
+    ws.on('close', (code: number, reason: string) => this.handleClose(code, reason));
     ws.on('ping', () => this.resetHeartbeat());
     return ws;
+  }
+
+  /**
+   * Fetch a Moonraker one-shot token (see {@link getOneshotToken}) and open the
+   * socket with it appended as `?token=`. Falls back to a tokenless connection
+   * when no token is available (no `[authorization]` component) or the fetch
+   * fails — the ensuing socket error/close then drives the normal retry path.
+   * @source
+   */
+  private async openWithOneshotToken(): Promise<void> {
+    let url = this.wsURL;
+    try {
+      const token = await this.getOneshotToken();
+      if (token) {
+        this.oneshotTokenObtained = true;
+        url += `${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
+      }
+    } catch {
+      // Token fetch failed (e.g. unreachable host); connect tokenless so the
+      // socket surfaces the real error via 'error'/'close'.
+    }
+    this.ws = this.openSocket(url);
   }
 
   /**
@@ -920,12 +1407,12 @@ export class MoonrakerClient extends EventEmitter {
    * PING frames, so a ping-only watchdog would terminate healthy
    * sockets.
    *
-   * @param data - The raw `Buffer` / typed-array payload as received
-   *   from `ws`. Decoded with `toString()` and JSON-parsed; parse
-   *   errors are re-emitted as `'error'` events.
+   * @param data - The inbound frame payload. Normally a UTF-8 JSON
+   *   `string`; decoded with `toString()` and JSON-parsed; parse errors
+   *   are re-emitted as `'error'` events.
    * @source
    */
-  private handleMessage(data: WebSocket.RawData): void {
+  private handleMessage(data: SocketData): void {
     // Any inbound traffic counts as liveness — Moonraker streams JSON
     // notifications continuously but doesn't send WebSocket-level PING
     // frames, so a ping-only heartbeat would terminate a perfectly healthy
@@ -977,7 +1464,7 @@ export class MoonrakerClient extends EventEmitter {
    */
   private resetHeartbeat(): void {
     if (this.pingTimeout !== null) clearTimeout(this.pingTimeout);
-    this.pingTimeout = setTimeout(() => this.ws.terminate(), this.heartbeatTimeoutMs);
+    this.pingTimeout = setTimeout(() => this.ws?.terminate(), this.heartbeatTimeoutMs);
   }
 
   /**
@@ -995,12 +1482,13 @@ export class MoonrakerClient extends EventEmitter {
    * @source
    */
   private async send(payload: JsonRpcRequest): Promise<void> {
-    if (this.ws.readyState !== SocketState.OPEN) {
-      throw new Error(`Cannot send: websocket not open (state ${this.ws.readyState})`);
+    const ws = this.ws;
+    if (!ws || ws.readyState !== SocketState.OPEN) {
+      throw new Error(`Cannot send: websocket not open (state ${this.readyState})`);
     }
-    const buf = Buffer.from(JSON.stringify(payload), 'utf-8');
+    const text = JSON.stringify(payload);
     await new Promise<void>((resolve, reject) => {
-      this.ws.send(buf, (err) => (err ? reject(err) : resolve()));
+      ws.send(text, (err) => (err ? reject(err) : resolve()));
     });
   }
 

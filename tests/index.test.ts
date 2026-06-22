@@ -21,7 +21,9 @@ describe('public exports', () => {
     expect(Object.keys(api).sort()).toEqual([
       'MoonrakerClient',
       'MoonrakerError',
+      'NativeWebSocketAdapter',
       'SocketState',
+      'defaultSocketFactory',
       'describeSocketState',
       'isGcodeResponseParams',
       'isJsonRpcErrorResponse',
@@ -29,6 +31,7 @@ describe('public exports', () => {
       'isJsonRpcNotification',
       'isJsonRpcResponse',
       'isProcStatUpdateParams',
+      'isRecord',
       'isStatusUpdateParams',
       'parseFanSettings',
     ]);

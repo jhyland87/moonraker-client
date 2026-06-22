@@ -33,12 +33,9 @@
     "docs": "typedoc",
     "docs:watch": "typedoc --watch"
   },
-  "dependencies": {
-    "ws": "^8.18.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^25.7.0",
-    "@types/ws": "^8.5.13",
     "@vitest/coverage-v8": "^4.1.6",
     "tsup": "^8.5.1",
     "typedoc": "^0.28.0",

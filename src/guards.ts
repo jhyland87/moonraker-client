@@ -39,6 +39,17 @@ export const isJsonRpcMessage = (value: unknown): value is JsonRpcMessage =>
   value.jsonrpc === '2.0';
 
 /**
+ * Narrow an unknown value to a plain object record. Useful at API boundaries
+ * for opaque payload fields (e.g. `configfile.settings`).
+ *
+ * @param value - Any value.
+ * @returns `true` iff `value` is a non-null, non-array object.
+ * @source
+ */
+export const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
  * Narrow a {@link JsonRpcMessage} to a request reply (success or error).
  * Replies carry a numeric `id` matching the originating request; pushed
  * notifications do not.

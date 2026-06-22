@@ -33,10 +33,13 @@ export {
   isJsonRpcNotification,
   isJsonRpcResponse,
   isProcStatUpdateParams,
+  isRecord,
   isStatusUpdateParams,
 } from './guards';
 export { SocketState, describeSocketState } from './socket-states';
 export type { SocketStateValue } from './socket-states';
+export { NativeWebSocketAdapter, defaultSocketFactory } from './sockets';
+export type { SocketData, SocketFactory, SocketLike } from './sockets';
 export type { MoonrakerEvents } from './events';
 export type {
   ClientConfig,
@@ -47,17 +50,35 @@ export type {
   FileEntry,
   GcodeFileMetadata,
   GcodeMetadataMap,
+  GcodeStoreEntry,
   GcodeThumbnail,
   HeaterStatus,
+  HistoryJob,
+  HistoryListOptions,
+  HistoryListResult,
+  HistoryTotalsResult,
+  JobQueueEntry,
+  JobQueueStatus,
+  JobTotals,
   JsonRpcErrorPayload,
   JsonRpcErrorResponse,
   JsonRpcMessage,
   JsonRpcNotification,
   JsonRpcRequest,
   JsonRpcSuccessResponse,
+  MachineCpuInfo,
+  MachineDistribution,
+  MachineServiceState,
+  MachineSystemInfo,
+  MoonrakerStatSample,
   PrinterObjectSpec,
   PrinterStatus,
+  ProcStats,
   SubscribeResult,
+  SystemMemory,
   TemperatureStore,
   TemperatureStoreSensor,
+  VelocityLimits,
+  WebcamInfo,
+  WebcamList,
 } from './types';

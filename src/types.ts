@@ -38,6 +38,22 @@ export interface ConnectionConfig {
    * the client uses its own internal handshake timeout constant.
    */
   readonly timeout?: number;
+  /**
+   * Moonraker API key. When set, it's sent as the `X-Api-Key` header while
+   * fetching the one-shot websocket token (needed for printers whose
+   * `[authorization]` component requires a key for untrusted clients).
+   */
+  readonly apiKey?: string;
+  /**
+   * Fetch a Moonraker one-shot token over HTTP and append it as `?token=` to
+   * the websocket URL before connecting. This is required when Moonraker's
+   * `[authorization]` component rejects untrusted websocket clients with HTTP
+   * 403 (as Fluidd/Mainsail do). Defaults to `true`; if the token endpoint is
+   * unavailable (e.g. no `[authorization]` configured) the client falls back to
+   * a tokenless connection. Set `false` to always connect directly (also keeps
+   * the connection fully synchronous, which tests rely on).
+   */
+  readonly oneshotToken?: boolean;
 }
 
 /**
@@ -439,3 +455,229 @@ export interface FileEntry {
  * @source
  */
 export type GcodeMetadataMap = Readonly<Record<string, GcodeFileMetadata>>;
+
+/**
+ * Kinematic limits accepted by {@link MoonrakerClient.setVelocityLimits}.
+ * Each field is optional; only the provided ones are applied.
+ * @source
+ */
+export interface VelocityLimits {
+  /** Max velocity, mm/s. */
+  readonly velocity?: number;
+  /** Max acceleration, mm/s². */
+  readonly accel?: number;
+  /** Acceleration-to-deceleration limit, mm/s². */
+  readonly accelToDecel?: number;
+  /** Square corner velocity, mm/s. */
+  readonly squareCornerVelocity?: number;
+}
+
+/**
+ * One entry from `server.gcode_store` — a buffered console line. `type` is
+ * `'command'` (echoed input) or `'response'` (printer output).
+ * @source
+ */
+export interface GcodeStoreEntry {
+  readonly message: string;
+  /** Unix-seconds timestamp. */
+  readonly time: number;
+  readonly type: 'command' | 'response' | string;
+}
+
+/**
+ * Options for {@link MoonrakerClient.getHistory} (`server.history.list`).
+ * @source
+ */
+export interface HistoryListOptions {
+  readonly limit?: number;
+  readonly start?: number;
+  /** Unix-seconds lower bound on job start time. */
+  readonly since?: number;
+  /** Unix-seconds upper bound on job start time. */
+  readonly before?: number;
+  readonly order?: 'asc' | 'desc';
+}
+
+/**
+ * One completed/aborted print job from `server.history.list`.
+ * @source
+ */
+export interface HistoryJob {
+  readonly job_id: string;
+  readonly filename: string;
+  /** `'completed' | 'cancelled' | 'error' | 'in_progress' | …` */
+  readonly status: string;
+  readonly start_time: number;
+  readonly end_time: number | null;
+  readonly print_duration: number;
+  readonly total_duration: number;
+  readonly filament_used: number;
+  readonly exists?: boolean;
+  readonly metadata?: Partial<GcodeFileMetadata>;
+}
+
+/**
+ * Result of `server.history.list`.
+ * @source
+ */
+export interface HistoryListResult {
+  readonly count: number;
+  readonly jobs: readonly HistoryJob[];
+}
+
+/**
+ * Aggregate print statistics from `server.history.totals`.
+ * @source
+ */
+export interface JobTotals {
+  readonly total_jobs: number;
+  readonly total_time: number;
+  readonly total_print_time: number;
+  readonly total_filament_used: number;
+  readonly longest_job: number;
+  readonly longest_print: number;
+}
+
+/** Result of `server.history.totals`. @source */
+export interface HistoryTotalsResult {
+  readonly job_totals: JobTotals;
+}
+
+/**
+ * One queued job from `server.job_queue.status`.
+ * @source
+ */
+export interface JobQueueEntry {
+  readonly filename: string;
+  readonly job_id: string;
+  readonly time_added: number;
+  readonly time_in_queue: number;
+}
+
+/**
+ * Result of `server.job_queue.status`.
+ * @source
+ */
+export interface JobQueueStatus {
+  readonly queued_jobs: readonly JobQueueEntry[];
+  /** `'ready' | 'loading' | 'starting' | 'paused'`. */
+  readonly queue_state: string;
+}
+
+/**
+ * Host CPU info from `machine.system_info`.
+ * @source
+ */
+export interface MachineCpuInfo {
+  readonly cpu_count?: number;
+  readonly bits?: string;
+  readonly processor?: string;
+  readonly cpu_desc?: string;
+  readonly hardware_desc?: string;
+  readonly model?: string;
+  readonly serial_number?: string;
+  readonly total_memory?: number;
+  readonly memory_units?: string;
+}
+
+/**
+ * Host OS distribution info from `machine.system_info`.
+ * @source
+ */
+export interface MachineDistribution {
+  readonly name?: string;
+  readonly id?: string;
+  readonly version?: string;
+  readonly codename?: string;
+}
+
+/**
+ * Per-service state map entry from `machine.system_info.service_state`.
+ * @source
+ */
+export interface MachineServiceState {
+  readonly active_state?: string;
+  readonly sub_state?: string;
+}
+
+/**
+ * Unwrapped `system_info` payload from `machine.system_info`. Only the
+ * commonly-used fields are typed; the rest remain accessible via the index
+ * signature.
+ * @source
+ */
+export interface MachineSystemInfo {
+  readonly provider?: string;
+  readonly cpu_info?: MachineCpuInfo;
+  readonly distribution?: MachineDistribution;
+  readonly virtualization?: { readonly virt_type?: string; readonly virt_identifier?: string };
+  readonly python?: { readonly version_string?: string };
+  readonly network?: Readonly<
+    Record<string, { mac_address?: string; ip_addresses?: readonly unknown[] }>
+  >;
+  readonly available_services?: readonly string[];
+  readonly service_state?: Readonly<Record<string, MachineServiceState>>;
+  readonly [key: string]: unknown;
+}
+
+/**
+ * One Moonraker resource sample from `machine.proc_stats.moonraker_stats`.
+ * @source
+ */
+export interface MoonrakerStatSample {
+  readonly time: number;
+  readonly cpu_usage: number;
+  readonly memory: number;
+  readonly mem_units: string;
+}
+
+/**
+ * System memory snapshot from `machine.proc_stats.system_memory` (kB).
+ * @source
+ */
+export interface SystemMemory {
+  readonly total: number;
+  readonly available: number;
+  readonly used: number;
+}
+
+/**
+ * Result of `machine.proc_stats`. `system_cpu_usage` carries an overall
+ * `cpu` percentage plus per-core `cpu0`, `cpu1`, … entries.
+ * @source
+ */
+export interface ProcStats {
+  readonly moonraker_stats: readonly MoonrakerStatSample[];
+  readonly throttled_state: { readonly bits: number; readonly flags: readonly string[] } | null;
+  readonly cpu_temp: number | null;
+  readonly network?: Readonly<Record<string, Record<string, number>>>;
+  readonly system_cpu_usage?: Readonly<Record<string, number>>;
+  readonly system_memory?: SystemMemory;
+  readonly system_uptime?: number;
+  readonly websocket_connections?: number;
+}
+
+/**
+ * One configured webcam from `server.webcams.list`. `stream_url` /
+ * `snapshot_url` may be relative to the Moonraker host.
+ * @source
+ */
+export interface WebcamInfo {
+  readonly name: string;
+  readonly location?: string;
+  readonly service?: string;
+  readonly enabled?: boolean;
+  readonly target_fps?: number;
+  readonly target_fps_idle?: number;
+  readonly stream_url: string;
+  readonly snapshot_url?: string;
+  readonly flip_horizontal?: boolean;
+  readonly flip_vertical?: boolean;
+  readonly rotation?: number;
+  readonly aspect_ratio?: string;
+  readonly source?: string;
+  readonly uid?: string;
+}
+
+/** Result of `server.webcams.list`. @source */
+export type WebcamList = readonly WebcamInfo[];

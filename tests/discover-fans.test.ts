@@ -1,17 +1,12 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { FakeWebSocket } from './_helpers/fakeWebSocket';
-
-vi.mock('ws', async () => {
-  const { FakeWebSocket: Fake } = await import('./_helpers/fakeWebSocket');
-  return { default: Fake };
-});
 
 import { MoonrakerClient, parseFanSettings } from '../src';
 import type { ClientConfig } from '../src';
 
 const baseConfig: ClientConfig = {
-  API: { connection: { server: '127.0.0.1', port: 7125 } },
+  API: { connection: { server: '127.0.0.1', port: 7125, oneshotToken: false } },
 };
 
 // A representative slice of `configfile.settings` covering every kind of key
@@ -95,7 +90,9 @@ describe('parseFanSettings', () => {
 
 describe('MoonrakerClient.discoverFans', () => {
   it('queries configfile.settings and resolves the discovery', async () => {
-    const client = new MoonrakerClient(baseConfig);
+    const client = new MoonrakerClient(baseConfig, {
+      socketFactory: (url) => new FakeWebSocket(url),
+    });
     const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
     ws.simulateOpen();
 
